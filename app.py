@@ -1,6 +1,21 @@
 from __future__ import annotations
 
+import os
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
+
+# --- CLOUD DEPLOYMENT HACK ---
+# Stackhost is headless, so we must generate the physical JSON files 
+# directly from the Environment Variables before the bot boots!
+creds_data = os.environ.get("GOOGLE_CREDENTIALS_FILE", "")
+if "{" in creds_data:
+    with open("credentials.json", "w", encoding="utf-8") as f:
+        f.write(creds_data)
+
+token_data = os.environ.get("GOOGLE_TOKEN_FILE", "")
+if "{" in token_data:
+    with open("token.json", "w", encoding="utf-8") as f:
+        f.write(token_data)
+# -----------------------------
 
 from agent import SakuraAgent
 from config import load_settings
@@ -23,8 +38,7 @@ async def post_init(application: Application):
     application.bot_data["user_service"] = UserService(user_repo)
     
     agent.bot = application.bot  
-    scheduler = Scheduler(application, agent)
-
+    
     scheduler = Scheduler(application, agent)
     application.bot_data["scheduler"] = scheduler
     agent.schedule_reminder = scheduler.schedule_reminder
@@ -66,6 +80,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("connect_google", connect_google_command))
+    
+    # Text and Media handler combined!
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE) & ~filters.COMMAND, 
         text_handler
