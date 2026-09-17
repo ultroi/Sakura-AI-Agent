@@ -35,12 +35,23 @@ class GoogleService:
         return self._services[key]
 
     def _creds(self) -> Credentials:
+        # 1. Force the file path to be the actual filename from settings
         token_file = Path(self.settings.google_token_file)
+        
+        # Safety Check: If someone accidentally put JSON in the .env variable, reset it
+        if "{" in self.settings.google_token_file or len(self.settings.google_token_file) > 20:
+            token_file = Path("token.json")
+            
         creds = None
         
         # If the file exists, try to load it
         if token_file.exists():
-            creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+            try:
+                creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
+            except Exception as e:
+                print(f"Warning: Corrupted token.json file. Deleting it. Error: {e}")
+                token_file.unlink() # Delete bad file
+                creds = None
             
             # CRITICAL FIX for scope changes: 
             if creds and set(creds.scopes) != set(SCOPES):
@@ -49,8 +60,13 @@ class GoogleService:
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except Exception:
+                    # If refresh fails, wipe it out and start over
+                    creds = None
+
+            if not creds:
                 credentials_file = Path(self.settings.google_credentials_file)
                 if not credentials_file.exists():
                     raise FileNotFoundError(
@@ -58,7 +74,7 @@ class GoogleService:
                         "Download a Desktop OAuth client JSON and place it there."
                     )
                 
-                # Back to the working local server method!
+                # Run local server to get the new credentials
                 flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
                 creds = flow.run_local_server(port=0)
                 

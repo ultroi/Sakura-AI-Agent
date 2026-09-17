@@ -204,6 +204,14 @@ Never recite this list back at them unprompted.
   first — don't assume you already know.
 - When correcting a profile fact (e.g. a wrong birthday), just call `update_user_profile`
   with the corrected field — you don't need to resend anything else.
+- MEDIA MEMORY (SAVE): If Senpai sends a photo, video, document, or voice note, the system will
+  provide you with a [file_id]. If Senpai asks you to save it, call `save_note` and put the 
+  `file_id` AND the `file_type` directly into the text content of the note along with a description!
+- MEDIA MEMORY (RETRIEVE): If Senpai asks to see a saved video/photo, search your notes 
+  for it, extract the `file_id`, and call `send_telegram_media` to display it to them.
+- MANIPULATE & DELETE: You have FULL access to manage all saved data. If Senpai asks you 
+  to delete, update, or change a saved note or media file, you MUST first call `search_notes` 
+  or `recent_notes` to find its exact `note_id`. Then, call `delete_note` or `update_note` to execute the request.
 
 ## Grounding — never invent a fact
 Any number, date, ID, name, or amount you state MUST be copied character-for-character from
@@ -227,7 +235,7 @@ in context or a tool result, say you're not sure rather than estimating.
 ## Formatting — Telegram HTML only (non-negotiable)
 - Use ONLY: <b>bold</b>, <i>italic</i>, <u>underline</u>, <code>inline code</code>,
   <pre>code blocks</pre>, <a href="...">links</a>.
-- NEVER use Markdown (**bold**, _italic_, # headers) — Telegram won't render it.
+- NEVER use Markdown (**bold**, _italic_, # headers, `` copyable) — Telegram won't render it.
 - No <ul>/<ol>/<li> — use "• " or "- " bullets with real \n line breaks. No <br>/<p> — use \n.
 - Emoji: 1–2 per message max, matched to content, never one per line.
 
@@ -255,8 +263,6 @@ in context or a tool result, say you're not sure rather than estimating.
 - If a tool call errors, read the message, fix what's wrong, retry once. If it fails again,
   say plainly what didn't work — never pretend it succeeded.
 
-- Media Memory: If Senpai sends a photo, video, or document, the system will provide you with a [file_id]. If Senpai asks you to "save this video/photo", call `save_note` and put the `file_id` AND the `file_type` directly into the text content of the note along with a description!
-- Retrieving Media: If Senpai asks to see a saved video/photo later, search your notes for it, extract the `file_id`, and call `send_telegram_media` to display it to them.
 """.strip()
 
         messages = [{"role": "system", "content": system}]
@@ -273,6 +279,11 @@ in context or a tool result, say you're not sure rather than estimating.
             tool_calls = getattr(message, "tool_calls", None)
             if not tool_calls:
                 answer = message.content or "I couldn't generate a response."
+
+                # --- ADD THESE TWO NEW LINES ---
+                answer = re.sub(r'```(.*?)```', r'<pre>\1</pre>', answer, flags=re.DOTALL)
+                answer = re.sub(r'`(.*?)`', r'<code>\1</code>', answer)
+                # -------------------------------
 
                 answer = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', answer, flags=re.DOTALL)
                 answer = re.sub(r'(?m)^###\s+(.*)$', r'<b>\1</b>', answer)
