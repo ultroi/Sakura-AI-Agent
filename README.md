@@ -1,133 +1,53 @@
-# Sakura — Personal Telegram AI Agent
+# Sakura (サクラ) 🌸
 
-Sakura is a single-agent personal assistant that lives in Telegram and can chat, use tools, remember recent conversations, create reminders, save notes, search the web, check weather, calculate, translate, fetch URLs, work with Gmail/Google Calendar/GitHub, and transcribe voice messages.
+> *A warm, sharp, and endlessly loyal anime-companion & personal assistant living inside Telegram.*
 
-## Architecture
+---
 
-Telegram → `agent.py` → registered tools in `tools.py` → MongoDB / external APIs.
+## 🌸 Overview
 
-The LLM uses Groq tool calling in a ReAct-style loop, with a maximum of 5 tool iterations per user request.
+**Sakura** is an anime-inspired AI companion built to be your devoted sidekick rather than a bland, robotic utility. She balances an affectionate, playful personality with high-efficiency execution—whether she is helping you debug code, managing your college schedules, tracking emails, or keeping tabs on daily tasks.
 
-## Requirements
+Sakura treats you exclusively as **Senpai**, keeping all notes, personal preferences, and connected accounts strictly isolated in a private digital sanctuary tailored completely to you.
 
-- Python 3.10+
-- MongoDB local or MongoDB Atlas
-- Telegram Bot token
-- Groq API key
-- Tavily API key for web search
-- GitHub personal access token for GitHub actions
-- Google OAuth Desktop credentials for Gmail + Calendar
+---
 
-All requested external services have free-access/free-tier options, but their quotas and policies can change. Check the provider's current terms before production use.
+## ✨ Core Highlights
 
-## Setup
+### 💖 Personality & Companion Voice
+* **Devoted to Senpai:** Speaks warmly, celebrating your achievements and cheering you on during late-night study or coding sprints.
+* **Charming Mannerisms:** Naturally sprinkles light Japanese expressions (*Ohayo*, *Daijoubu*, *Yatta!*, *Matane!*) into conversation without dropping character.
+* **Adaptive Demeanor:** Playful and sweet during casual banter, yet focused and concise when handling critical requests.
 
-### 1. Create a virtual environment
+### 🧠 Memory & Context
+* **Persistent Profile:** Remembers your identity, important dates, study field, and ongoing preferences so you never have to repeat yourself.
+* **Long-Term Notes:** Archives specific memories, reminders, and notes on demand. Ask *"What did I say about MongoDB?"* and she retrieves it instantly.
+* **Media Vault:** Saves and returns photos, documents, and media whenever you request them.
 
-Windows PowerShell:
+### ⚡ Assistant Capabilities
+* **Visual Understanding:** Reads timetables, handwritten notes, and text from photos or screenshots using vision capabilities.
+* **Inbox & Calendar:** Checks unread emails, creates calendar events, and sends replies directly from chat.
+* **Developer Utilities:** Lists GitHub repositories, monitors open issues, and files bug reports on the fly.
+* **Daily Utilities:** Live weather reports, web searches, math evaluation, multi-language translation, and voice note transcription.
+* **Morning Briefing:** Delivers a scheduled morning digest covering your agenda, pending tasks, and reminders.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+---
 
-Linux/macOS:
+## 💬 Interacting with Sakura
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+Sakura responds to natural, conversational instructions:
 
-### 2. Configure `.env`
+* **Schedules & Alarms:**  
+  `Sakura, remind me tomorrow at 9:00 AM to submit my assignment.`
+* **Study & Notes:**  
+  `Remember that my data warehousing exam is scheduled for Friday.`
+* **Vision & Media:**  
+  `Check out this timetable photo and tell me my lectures for tomorrow.`
+* **Communications:**  
+  `Did I get any important emails from college today?`
+* **Development:**  
+  `Create a GitHub issue titled 'Fix authentication bug' in my repo.`
+* **Quick Lookups:**  
+  `What's the weather forecast for today?`
 
-Copy `.env.example` to `.env` and fill in:
-
-```env
-BOT_TOKEN=...
-GROQ_API_KEY=...
-MONGODB_URI=mongodb://localhost:27017
-MONGODB_DB=sakura
-TAVILY_API_KEY=...
-GITHUB_TOKEN=...
-TIMEZONE=Asia/Kolkata
-DIGEST_TIME=08:00
-OWNER_TELEGRAM_ID=...
-GOOGLE_CREDENTIALS_FILE=credentials.json
-GOOGLE_TOKEN_FILE=token.json
-```
-
-### 3. MongoDB
-
-For local MongoDB, start the MongoDB service. For Atlas, put the Atlas URI in `MONGODB_URI`.
-
-### 4. Google OAuth
-
-Create a Google Cloud project, enable Gmail API + Calendar API, configure the OAuth consent screen, create a Desktop OAuth client, and download the client JSON as `credentials.json`.
-
-Run Sakura, then use `/connect_google` in Telegram. The standard local-browser OAuth flow will create `token.json`.
-
-The application requests Gmail modify access and Calendar access because it must read/send email and create/read calendar events.
-
-### 5. Run
-
-```bash
-python app.py
-```
-
-Open Telegram and send `/start`.
-
-## Examples
-
-- `remind me tomorrow at 10am to call John`
-- `remember that my database exam is on Friday`
-- `what did I save about MongoDB?`
-- `what is the weather in Jaipur?`
-- `search the web for the latest Python release`
-- `calculate (25 * 17) / 3`
-- `translate “How are you?” to Japanese`
-- `summarize https://example.com/article`
-- `show my upcoming calendar events`
-- `send an email to ...`
-- `list my GitHub repos`
-- `create a GitHub issue in owner/repo ...`
-- Send a Telegram voice message and Sakura will transcribe it before handling it.
-
-## Extending Sakura with a new tool
-
-All agent tools are registered in `tools.py` through `ToolRegistry.register`.
-
-Add another function like:
-
-```python
-@r.register(
-    "my_tool",
-    "What this tool does",
-    {
-        "type": "object",
-        "properties": {
-            "value": {"type": "string"}
-        },
-        "required": ["value"]
-    },
-)
-async def _my_tool(value: str):
-    try:
-        return f"Result: {value}"
-    except Exception as exc:
-        return f"Tool error: {exc}"
-```
-
-The LLM sees the schema automatically and can select the tool.
-
-## Security notes
-
-- Never commit `.env`, `credentials.json`, or `token.json`.
-- GitHub write access and Gmail send access are powerful. Review tool calls and scopes carefully.
-- This project is designed as a personal assistant, not as a public multi-tenant SaaS.
-- URL fetching is intended for public URLs. Do not point it at internal services.
-
-## Important implementation note
-
-Reminders are persisted in MongoDB and restored on startup. Morning digest uses the Telegram job queue. If the bot is offline when a reminder becomes due, Sakura sends it as soon as possible after restart.
+---
