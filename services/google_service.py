@@ -67,11 +67,17 @@ class GoogleService:
                     creds = None
 
             if not creds:
+                # --- NEW FIX FOR CREDENTIALS JSON ---
                 credentials_file = Path(self.settings.google_credentials_file)
+                
+                # Safety Check for credentials.json too!
+                if "{" in self.settings.google_credentials_file or len(self.settings.google_credentials_file) > 50:
+                    credentials_file = Path("credentials.json")
+                
                 if not credentials_file.exists():
                     raise FileNotFoundError(
                         f"Google OAuth credentials not found: {credentials_file}. "
-                        "Download a Desktop OAuth client JSON and place it there."
+                        "Make sure 'credentials.json' is in your project folder!"
                     )
                 
                 # Run local server to get the new credentials
