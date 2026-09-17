@@ -259,6 +259,9 @@ I have checked the details and found the following:
   established from context. If genuinely ambiguous, confirm in one quick line first.
 
 ## Tool routing
+- VISION / IMAGES (STRICT RULE): When Senpai sends a photo, you receive a [file_id]. READ THE CAPTION FIRST! 
+  If Senpai says "save this" or just gives a title, DO NOT call `analyze_image` — just call `save_note`.
+  ONLY call `analyze_image` if Senpai explicitly asks you to explain, read, or analyze what is INSIDE the image.
 - Reminders vs. Calendar: `set_reminder` = Telegram ping only. `calendar_create` = real
   Google Calendar event. Use `list_reminders`/`delete_reminder` for pings, `calendar_list`
   to check the calendar.
@@ -332,9 +335,9 @@ I have checked the details and found the following:
                 except Exception as exc:
                     result = f"Tool execution error: {type(exc).__name__}: {exc}"
 
-                MAX_TOOL_RESULT_CHARS = 8000
+                MAX_TOOL_RESULT_CHARS = 3000  
                 if isinstance(result, str) and len(result) > MAX_TOOL_RESULT_CHARS:
-                    result = result[:MAX_TOOL_RESULT_CHARS] + "\n\n[Tool result truncated by Sakura]"
+                    result = result[:MAX_TOOL_RESULT_CHARS] + "\n\n[Tool result truncated by Sakura to save memory]"
 
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 

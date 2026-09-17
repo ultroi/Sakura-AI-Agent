@@ -238,7 +238,7 @@ def register_tools(agent):
         "List recent Gmail messages. ALWAYS USE THIS FIRST to get message_ids before calling gmail_read. Optional query uses standard Gmail search syntax.",
         {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 20}}, "required": []},
     )
-    async def _gmail_list(query: str = "", max_results: int = 10):
+    async def _gmail_list(query: str = "", max_results: int = 3):
         try:
             data = await asyncio.to_thread(agent.google.gmail_list, query, max_results)
             return json.dumps(data, ensure_ascii=False)
@@ -734,3 +734,51 @@ def register_tools(agent):
             return f"Success! The {file_type} was sent to the chat."
         except Exception as exc:
             return f"Failed to send {file_type}: {exc}"
+
+
+    @r.register(
+        "analyze_image",
+        "Use this tool to 'see' and read an image ONLY IF Senpai explicitly asks a question about its contents. DO NOT use this if Senpai just wants to save the image.",
+        {
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string"},
+                "prompt": {"type": "string", "description": "What to ask the vision model about the image (default: 'Describe this image in detail and read any text in it.')"}
+            },
+            "required": ["file_id"]
+        },
+    )
+    async def _analyze_image(file_id: str, prompt: str = "Describe this image in detail and read any text in it."):
+        api_key = getattr(agent.settings, "gemini_api_key", None)
+        if not api_key:
+            return "Vision error: GEMINI_API_KEY is not configured in settings. Tell Senpai to add it to .env."
+        
+        try:
+            import base64
+            # 1. Download image bytes from Telegram
+            if not hasattr(agent, "bot"):
+                return "Error: Telegram bot not connected."
+            
+            tg_file = await agent.bot.get_file(file_id)
+            image_bytes = await tg_file.download_as_bytearray()
+            base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            
+            # 2. Send directly to Gemini 1.5 Flash (Free Tier)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}}
+                    ]
+                }]
+            }
+            
+            response = await agent.http_client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+            
+        except Exception as exc:
+            return f"Vision processing error: {exc}"

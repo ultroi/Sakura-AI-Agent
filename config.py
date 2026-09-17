@@ -16,11 +16,12 @@ class Settings:
     groq_api_key: str
     mongodb_uri: str
     mongodb_db: str
-    owner_telegram_id: int
+    gemini_api_key: str | None
     tavily_api_key: str | None
     github_token: str | None
     timezone: str
     digest_time: str
+    owner_telegram_id: int | None
     owner_telegram_id: int | None
     google_credentials_file: str
     google_token_file: str
@@ -46,6 +47,7 @@ def load_settings() -> Settings:
         groq_api_key=_required("GROQ_API_KEY"),
         mongodb_uri=_required("MONGODB_URI"),
         google_maps_api_key=_required("GOOGLE_MAPS_API_KEY"),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip() or None,
         mongodb_db=os.getenv("MONGODB_DB", "sakura").strip() or "sakura",
         tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip() or None,
         github_token=os.getenv("GITHUB_TOKEN", "").strip() or None,
