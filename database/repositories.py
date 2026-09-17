@@ -80,6 +80,10 @@ class ConversationRepository:
         docs.reverse()
         return [{"role": d["role"], "content": d["content"]} for d in docs]
 
+    async def clear(self, telegram_id: int):
+        """Clears the recent chat history for a user to reset the context."""
+        await self.collection.delete_many({"telegram_id": telegram_id})
+
 
 class NoteRepository:
     def __init__(self, db):

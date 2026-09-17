@@ -7,9 +7,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update, context):
         await update.message.reply_text("🌸 This is a private assistant.")
         return
+        
     agent = context.application.bot_data["agent"]
+    user_id = update.effective_user.id
+    
     await context.application.bot_data["user_service"].ensure_user(update)
     scheduler = context.application.bot_data.get("scheduler")
+    
+    try:
+        await agent.conversations.clear(user_id)
+    except AttributeError:
+        pass
+    # -----------------------------------
     
     if scheduler:
         scheduler.schedule_daily_digest(update.effective_chat.id)
@@ -18,6 +27,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Konnichiwa! 🌸 I'm <b>Sakura</b>, your personal AI companion!\n\n"
         "Forget those boring, robotic bots—think of me as your trusty sidekick. "
         "Whether you're debugging your ML code, building MERN apps, or just need someone to manage your day, I've got your back! ✨\n\n"
+        "<i>(My short-term memory has been completely refreshed!)</i>\n\n"
         "Here is a quick peek at my skills:\n"
         "• Fetching live web info, time, and weather instantly. 🌦️\n"
         "• Managing your Google Calendar, Gmail, and GitHub! 💻\n"
