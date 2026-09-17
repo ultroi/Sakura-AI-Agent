@@ -751,19 +751,26 @@ def register_tools(agent):
     async def _analyze_image(file_id: str, prompt: str = "Describe this image in detail and read any text in it."):
         api_key = getattr(agent.settings, "gemini_api_key", None)
         if not api_key:
-            return "Vision error: GEMINI_API_KEY is not configured in settings. Tell Senpai to add it to .env."
+            return "Vision error: GEMINI_API_KEY is not configured in settings."
         
         try:
             import base64
-            # 1. Download image bytes from Telegram
             if not hasattr(agent, "bot"):
                 return "Error: Telegram bot not connected."
             
-            tg_file = await agent.bot.get_file(file_id)
-            image_bytes = await tg_file.download_as_bytearray()
-            base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            # Clean file_id just in case the LLM added hidden spaces/newlines
+            file_id = file_id.strip()
             
-            # 2. Send directly to Gemini 1.5 Flash (Free Tier)
+            # --- STEP 1: Download from Telegram ---
+            try:
+                tg_file = await agent.bot.get_file(file_id)
+                image_bytes = await tg_file.download_as_bytearray()
+                base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            except Exception as e:
+                return f"Telegram File Download Error: Could not fetch image from Telegram. Details: {e}"
+            
+            # --- STEP 2: Send to Gemini ---
+            # Using the universally supported 'gemini-1.5-flash-latest' endpoint
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
             payload = {
                 "contents": [{
@@ -774,11 +781,18 @@ def register_tools(agent):
                 }]
             }
             
-            response = await agent.http_client.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
+            response = await agent.http_client.post(
+                url, 
+                json=payload, 
+                headers={"Content-Type": "application/json"}
+            )
             
+            # Catch raw HTTP errors from Google and return the exact text
+            if response.status_code != 200:
+                return f"Gemini API Error {response.status_code}: {response.text}"
+                
+            data = response.json()
             return data["candidates"][0]["content"]["parts"][0]["text"]
             
         except Exception as exc:
-            return f"Vision processing error: {exc}"
+            return f"Vision processing error: {type(exc).__name__}: {exc}"
