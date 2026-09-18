@@ -80,8 +80,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("connect_google", connect_google_command))
-    
-    # Text and Media handler combined!
     application.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VOICE) & ~filters.COMMAND, 
         text_handler

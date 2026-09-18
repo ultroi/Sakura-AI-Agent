@@ -291,7 +291,15 @@ def register_tools(agent):
     @r.register(
         "gmail_send",
         "Send an email from the connected Gmail account.",
-        {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]},
+        {
+            "type": "object", 
+            "properties": {
+                "to": {"type": "string"}, 
+                "subject": {"type": "string"}, 
+                "body": {"type": "string", "description": "The email message body in clean, professional plain text. DO NOT include Telegram HTML tags like <b> or <code>."}
+            }, 
+            "required": ["to", "subject", "body"]
+        },
     )
     async def _gmail_send(to: str, subject: str, body: str):
         try:
@@ -796,3 +804,197 @@ def register_tools(agent):
             
         except Exception as exc:
             return f"Vision processing error: {type(exc).__name__}: {exc}"
+
+    @r.register(
+        "analyze_document",
+        "Use this tool to read, parse, and analyze an uploaded document (PDF, Word doc, Excel/CSV, or text file) ONLY IF Senpai explicitly asks a question or instructs you to read its contents. DO NOT use this if Senpai just asks to save or store the document.",
+        {
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string", "description": "The Telegram file_id of the document."},
+                "file_name": {"type": "string", "description": "The filename with extension (e.g. report.pdf, data.xlsx)."},
+                "prompt": {"type": "string", "description": "What specific information or analysis to extract from the document."}
+            },
+            "required": ["file_id"]
+        },
+    )
+    async def _analyze_document(file_id: str, file_name: str = "", prompt: str = "Summarize and extract key information from this document."):
+        api_key = getattr(agent.settings, "gemini_api_key", None)
+        if not api_key:
+            return "Document analysis error: GEMINI_API_KEY is not configured in settings."
+        if not hasattr(agent, "bot"):
+            return "Error: Telegram bot not connected."
+
+        try:
+            import base64
+            import mimetypes
+
+            file_id = file_id.strip()
+
+            # 1. Determine MIME type
+            mime_type = "application/pdf"
+            if file_name:
+                guessed, _ = mimetypes.guess_type(file_name)
+                if guessed:
+                    mime_type = guessed
+                elif file_name.endswith((".xlsx", ".xls")):
+                    mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                elif file_name.endswith((".docx", ".doc")):
+                    mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                elif file_name.endswith(".csv"):
+                    mime_type = "text/csv"
+
+            # 2. Download from Telegram
+            tg_file = await agent.bot.get_file(file_id)
+            doc_bytes = await tg_file.download_as_bytearray()
+            base64_doc = base64.b64encode(doc_bytes).decode("utf-8")
+
+            # 3. Request Gemini Multimodal Engine
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": mime_type, "data": base64_doc}}
+                    ]
+                }]
+            }
+
+            response = await agent.http_client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=120.0
+            )
+
+            if response.status_code != 200:
+                return f"Gemini Document API Error {response.status_code}: {response.text}"
+
+            data = response.json()
+            candidates = data.get("candidates", [])
+            if not candidates or "content" not in candidates[0]:
+                return "The document could not be analyzed (possibly blocked by safety filters or empty content)."
+
+            return candidates[0]["content"]["parts"][0]["text"]
+
+        except Exception as exc:
+            return f"Document processing error: {type(exc).__name__}: {exc}"
+
+
+    @r.register(
+        "inspect_telegram_context",
+        "Inspect Telegram metadata for the user's latest incoming message. Extracts user profile details, chat IDs, whether the message was forwarded, and the original sender's ID, name, or channel username if forwarded.",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    async def _inspect_telegram_context():
+        # Requires current Telegram update/message context attached to agent
+        msg = getattr(agent, "current_message", None)
+        if not msg:
+            return json.dumps({
+                "telegram_id": agent.telegram_id,
+                "chat_id": agent.chat_id,
+                "note": "Raw message object not cached; showing active session IDs."
+            }, ensure_ascii=False)
+
+        user = msg.from_user
+        meta = {
+            "sender": {
+                "id": user.id if user else None,
+                "first_name": user.first_name if user else None,
+                "last_name": user.last_name if user else None,
+                "username": user.username if user else None,
+                "is_bot": user.is_bot if user else False,
+            },
+            "chat": {
+                "id": msg.chat.id,
+                "type": msg.chat.type,
+                "title": getattr(msg.chat, "title", None)
+            },
+            "message_id": msg.message_id,
+            "is_forwarded": bool(
+                getattr(msg, "forward_date", None) 
+                or getattr(msg, "forward_origin", None)
+            ),
+            "forward_origin": None
+        }
+
+        # Handle modern PTB v20+ forward_origin structure
+        origin = getattr(msg, "forward_origin", None)
+        if origin:
+            origin_type = getattr(origin, "type", "unknown")
+            origin_info = {"type": origin_type}
+            if origin_type == "user" and hasattr(origin, "sender_user"):
+                u = origin.sender_user
+                origin_info.update({"id": u.id, "name": u.full_name, "username": u.username})
+            elif origin_type == "channel" and hasattr(origin, "chat"):
+                c = origin.chat
+                origin_info.update({"id": c.id, "title": c.title, "username": c.username})
+            elif origin_type == "chat" and hasattr(origin, "sender_chat"):
+                sc = origin.sender_chat
+                origin_info.update({"id": sc.id, "title": sc.title, "username": sc.username})
+            elif origin_type == "hidden_user":
+                origin_info.update({"sender_user_name": getattr(origin, "sender_user_name", "Hidden Account")})
+            meta["forward_origin"] = origin_info
+
+        return json.dumps(meta, ensure_ascii=False)
+
+
+    @r.register(
+        "send_inline_keyboard",
+        "Send an interactive message with clickable inline buttons. USE SPARINGLY and only when Senpai requires quick links, confirmations (Yes/No), or selection choices. Do NOT spam buttons on ordinary chats.",
+        {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Message text above the buttons (Valid Telegram HTML format)."
+                },
+                "buttons": {
+                    "type": "array",
+                    "description": "2D list representing rows of buttons. Each button must have 'text' and either 'url' or 'callback_data'.",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "url": {"type": "string"},
+                                "callback_data": {"type": "string"}
+                            },
+                            "required": ["text"]
+                        }
+                    }
+                }
+            },
+            "required": ["text", "buttons"]
+        }
+    )
+    async def _send_inline_keyboard(text: str, buttons: list[list[dict]]):
+        if not hasattr(agent, "bot"):
+            return "Error: Telegram Bot instance not connected."
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            keyboard = []
+            for row in buttons:
+                kb_row = []
+                for b in row:
+                    kb_row.append(
+                        InlineKeyboardButton(
+                            text=b["text"],
+                            url=b.get("url"),
+                            callback_data=b.get("callback_data")
+                        )
+                    )
+                keyboard.append(kb_row)
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await agent.bot.send_message(
+                chat_id=agent.chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="HTML"
+            )
+            return "Success: Inline keyboard message delivered to chat."
+        except Exception as exc:
+            return f"Failed to send inline keyboard: {exc}"
