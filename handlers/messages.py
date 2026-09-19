@@ -1,19 +1,15 @@
 from __future__ import annotations
-
 import asyncio
 import contextlib
 import html
 import os
 import secrets
 import tempfile
-
 from telegram import Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
-
 from handlers.helpers import is_owner, send_response_safely
-
 
 # =============================================================================
 # CONFIG
@@ -71,12 +67,6 @@ def split_text_safely(
     text: str,
     max_length: int = MAX_NORMAL_MESSAGE_LENGTH,
 ) -> list[str]:
-    """
-    Split long text at a newline/space when possible.
-
-    This intentionally keeps chunks below Telegram's normal 4096-character
-    sendMessage limit.
-    """
     if not text:
         return [""]
 
@@ -112,17 +102,6 @@ async def send_rich_message_draft(
     draft_id: int,
     text: str,
 ):
-    """
-    Send one frame of Telegram's native AI thinking draft.
-
-    Telegram Bot API:
-        sendRichMessageDraft
-        rich_message = {"html": "<tg-thinking>...</tg-thinking>"}
-
-    IMPORTANT:
-    <tg-thinking> is NOT a normal sendMessage/editMessageText tag.
-    It is specifically supported inside sendRichMessageDraft.
-    """
     safe_text = html.escape(text, quote=False)
 
     await bot.do_api_request(
@@ -175,12 +154,6 @@ async def animate_legacy_thinking(
     message,
     stages: tuple[str, ...],
 ):
-    """
-    Fallback animation for chats where Rich Message drafts are unavailable.
-
-    This preserves the previous behavior for groups/supergroups/channels
-    or older Telegram clients/API environments.
-    """
     index = 0
 
     try:
@@ -254,8 +227,6 @@ async def start_thinking(
             return task, None, draft_id
 
         except TelegramError:
-            # Fall through to the old message-edit animation if Rich Messages
-            # are not available for this bot/chat/API environment.
             pass
 
     # Legacy fallback.
@@ -341,17 +312,6 @@ async def deliver_final_response(
     answer: str,
     thinking_message=None,
 ):
-    """
-    Deliver Sakura's final answer.
-
-    Private chat:
-        - Prefer sendRichMessage so it properly finalizes the native draft.
-        - Fall back to regular Telegram HTML/plain text if Rich Messages fail.
-
-    Group/supergroup/etc.:
-        - Preserve the project's existing send_response_safely behavior when
-          there is a legacy thinking message.
-    """
     chat = update.effective_chat
 
     # -------------------------------------------------------------------------
@@ -367,9 +327,6 @@ async def deliver_final_response(
             return
 
         except TelegramError:
-            # Rich HTML can fail if the AI produced malformed HTML or Telegram
-            # rejects an unsupported construct.
-            # Fall back to standard Bot API sending below.
             pass
 
     # -------------------------------------------------------------------------
@@ -386,8 +343,7 @@ async def deliver_final_response(
     # -------------------------------------------------------------------------
     # Native draft fallback
     # -------------------------------------------------------------------------
-    # There is no Message object to edit because native drafts are ephemeral,
-    # so create the final response as a normal message.
+
     chunks = split_text_safely(answer)
 
     for index, chunk in enumerate(chunks):
@@ -712,10 +668,18 @@ async def voice_handler(
         await stop_thinking(animation_task)
 
         answer_stages = (
-            "Understanding what you said",
-            "Processing the conversation context",
-            "Thinking about the best response",
-            "Preparing the answer",
+            "Thinking",
+            "Thinking.",
+            "Thinking..",
+            "Thinking...",
+            "Thinking..",
+            "Thinking.",
+            "Thinking..",
+            "Thinking...",
+            "Thinking..",
+            "Thinking.",
+            "Thinking",
+            
         )
 
         # ---------------------------------------------------------------------
@@ -767,15 +731,9 @@ async def voice_handler(
             f"🎙️ <i>{escaped_transcription}</i>\n\n"
             f"{answer}"
         )
-
-        # ---------------------------------------------------------------------
-        # Stop thinking
-        # ---------------------------------------------------------------------
         await stop_thinking(animation_task)
 
-        # ---------------------------------------------------------------------
-        # Native final response
-        # ---------------------------------------------------------------------
+
         if draft_id is not None and thinking_msg is None:
             try:
                 await send_rich_final_response(
@@ -785,8 +743,6 @@ async def voice_handler(
                 )
 
             except TelegramError:
-                # Fallback if Sakura's generated HTML is invalid or Telegram
-                # rejects the rich message.
                 chunks = split_text_safely(final_text)
 
                 for index, chunk in enumerate(chunks):
@@ -801,9 +757,6 @@ async def voice_handler(
                             parse_mode=ParseMode.HTML,
                         )
 
-        # ---------------------------------------------------------------------
-        # Legacy final response
-        # ---------------------------------------------------------------------
         else:
             remaining = final_text
             is_first_chunk = True
