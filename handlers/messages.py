@@ -321,13 +321,12 @@ async def send_rich_final_response(
         )
 
     # Exactly one of html, markdown, or blocks is required by
-    # InputRichMessage.
     return await context.bot.do_api_request(
         "sendRichMessage",
         api_kwargs={
             "chat_id": chat.id,
             "rich_message": {
-                "html": answer,
+                "markdown": answer,
             },
             "reply_parameters": {
                 "message_id": source_message.message_id,
