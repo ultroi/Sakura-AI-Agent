@@ -22,6 +22,106 @@ from utils.logger import setup_logger
 ToolFunc = Callable[..., Awaitable[str]]
 
 
+# Telegram Rich Messages support Rich Markdown directly.  Using Markdown as the
+# model's output contract is much more reliable than asking the model to invent
+# HTML tags and then trying to repair malformed nesting afterwards.
+_ALLOWED_INLINE_HTML = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "code", "mark", "sub", "sup", "tg-spoiler", "a", "details",
+    "summary", "tg-math", "tg-math-block", "tg-reference", "tg-emoji",
+    "tg-time",
+}
+
+
+def normalize_rich_markdown(text: str) -> str:
+    """
+    Deterministically clean model output before passing it to Telegram's
+    Rich Markdown parser.
+
+    The model is not trusted to author Telegram HTML. Markdown is used as the
+    output contract because Telegram parses headings/lists/tables/quotes/code
+    natively in Rich Messages.
+    """
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\\n", "\n")
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+
+    # Protect fenced code blocks before touching HTML or bullet separators.
+    fenced: list[str] = []
+
+    def stash_code(match: re.Match[str]) -> str:
+        fenced.append(match.group(0))
+        return f"\n@@__SAKURA_CODE_{len(fenced)-1}__@@\n"
+
+    text = re.sub(r"```[\s\S]*?```", stash_code, text)
+
+    # Remove unsupported HTML tags outside code. The model should use Markdown
+    # for normal formatting, not arbitrary HTML tags.
+    def clean_tag(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        m = re.match(r"</?\s*([A-Za-z0-9-]+)", raw)
+        if not m:
+            return raw
+        name = m.group(1).lower()
+        return raw if name in _ALLOWED_INLINE_HTML else ""
+
+    text = re.sub(
+        r"</?\s*[A-Za-z0-9-]+(?:\s+[^<>]*?)?/?>",
+        clean_tag,
+        text,
+    )
+
+    # Repair a common model failure visible in long assistant replies: several
+    # logical bullet items get concatenated into one paragraph with ` • `.
+    paragraphs = re.split(r"(\n\s*\n)", text)
+    repaired: list[str] = []
+
+    for part in paragraphs:
+        if part == "\n\n" or not part.strip():
+            repaired.append(part)
+            continue
+
+        bullet_count = len(re.findall(r"\s+•\s+", part))
+        if bullet_count >= 2 and "@@__SAKURA_CODE_" not in part:
+            part = re.sub(r"\s+•\s+", "\n- ", part)
+
+        repaired.append(part)
+
+    text = "".join(repaired)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text).strip()
+
+    # Restore fenced code exactly.
+    for i, block in enumerate(fenced):
+        text = text.replace(
+            f"@@__SAKURA_CODE_{i}__@@",
+            block.strip("\n"),
+        )
+
+    return text
+
+
+def rich_markdown_to_plain(text: str) -> str:
+    """Safe plain-text fallback when Rich Messages are unavailable."""
+    if not text:
+        return ""
+
+    text = re.sub(r"```(?:[A-Za-z0-9_+.-]+)?\n?", "", text)
+    text = text.replace("```", "")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+[.)]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"__(.*?)__", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
+    return re.sub(r"\n{4,}", "\n\n", text).strip()
+
+
 class ToolRegistry:
     def __init__(self):
         self.functions: dict[str, ToolFunc] = {}
@@ -290,55 +390,30 @@ in context or a tool result, say you're not sure rather than estimating.
 Differentiate clearly between what is displayed in Telegram vs what is passed into tool arguments.
 
 1. FOR TELEGRAM CHAT DISPLAY (Direct messages to Senpai):
-You MUST output valid Telegram Rich HTML whenever formatting materially improves readability.
+You MUST output <b>Telegram Rich Markdown</b>. Do NOT generate ordinary Telegram HTML as the primary format.
+Telegram's Rich Message parser natively supports headings, lists, tables, blockquotes, details blocks, fenced code, inline formatting, and formulas.
 
-Use formatting according to the request, not everywhere:
-• Casual/simple replies: keep formatting light with <b>, <i>, <code>, and <a>.
-• Explanations/tutorials: use <h2>/<h3>, <p>, <ul>/<ol>/<li>, <blockquote>, and <pre><code class="language-...">...</code></pre> when useful.
-• Structured comparisons/data: use <table> when a real table is clearer than bullets.
-• Long document/PDF analysis: use <h2>/<h3> sections and <details><summary>...</summary>...</details> for optional/deeper sections.
-• Mathematics: use <tg-math-block>LaTeX</tg-math-block> for standalone equations and <tg-math>...</tg-math> for inline math when useful.
-• Important text: <mark>, <u>, <s>, and <tg-spoiler> may be used sparingly.
-• Quotes: use <blockquote> or <aside> only when semantically appropriate.
+Formatting rules:
+• Casual/simple replies: keep formatting light with **bold**, _italic_, `inline code`, and links.
+• Explanations/tutorials: use # / ## headings, short paragraphs, and real Markdown lists.
+• Structured comparisons/data: use a Markdown table when it is genuinely clearer.
+• Long document/PDF analysis: use ## / ### sections and <details><summary>...</summary>...</details> for optional deeper material.
+• Mathematics: use <tg-math-block>LaTeX</tg-math-block> for standalone equations and <tg-math>...</tg-math> inline when useful.
+• Important text: **bold**, ==marked text==, and > blockquotes may be used sparingly.
+• Code: ALWAYS use fenced code blocks with the language when known, e.g. ```python ... ```.
 
-Supported Rich HTML for Sakura's final responses:
-<b>, <strong>, <i>, <em>, <u>, <ins>, <s>, <strike>, <del>,
-<code>, <pre>, <mark>, <sub>, <sup>, <tg-spoiler>,
-<a>, <p>, <h1>, <h2>, <h3>, <h4>, <h5>, <h6>, <footer>, <hr>,
-<ul>, <ol>, <li>, <blockquote>, <aside>, <cite>, <details>, <summary>,
-<tg-math>, <tg-math-block>, <tg-reference>, <tg-emoji>, <tg-time>,
-<table>, <caption>, <tr>, <th>, <td>.
-
-Allowed attributes should be kept minimal and semantic:
-• <a>: href/name
-• <pre>/<code>: class="language-..."
-• <details>: open
-• <ol>: start/type/reversed
-• <li>: value/type
-• <td>/<th>: colspan/rowspan/align/valign
-• <tg-reference>: name
-• <tg-emoji>: emoji-id
-• <tg-time>: unix/format
-• <table>: bordered/striped
-• <tr>/<th>/<td>: normal table structure only
-
-Do NOT generate Rich HTML that this handler does not explicitly provide:
-• No <img>, <video>, <audio>, <tg-collage>, <tg-slideshow>
-• No <tg-button> or button rows
-• No tg:// media references
-
-Important:
-• Do NOT wrap every sentence in tags.
-• Do NOT use headings for tiny replies.
-• Do NOT use tables when 2-3 bullets are clearer.
-• Prefer semantic structure over decorative formatting.
-• Use real <ul>/<ol>/<li> for lists when they improve readability.
-• For code, use <pre><code class="language-python">...</code></pre> or the correct language.
-• For tables, keep cell contents short and use inline formatting inside cells only.
-• For long analyses, use <details> for optional depth instead of huge walls of text.
-• Use valid HTML nesting and close every tag.
-• Escape literal '<', '>', and '&' when they are not part of a supported tag/entity.
-• Output Telegram-facing HTML, not Markdown fences or Markdown emphasis.
+HARD RULES:
+• Never output explanations about formatting like "I'll use proper formatting". Just format the answer.
+• Never invent HTML tags such as <div>, <section>, <table-row>, <span>, or custom tags.
+• Do not manually write <table> HTML; use a Markdown table.
+• Do not manually write <ul>, <ol>, or <li>; use Markdown lists.
+• The only HTML allowed in normal Rich Markdown is the specific Telegram extensions that Markdown cannot express cleanly, especially <details>, <summary>, <tg-math>, and <tg-math-block>.
+• Keep every fenced code block intact and never apply formatting inside it.
+• Use blank lines between logical sections.
+• Use one list item per line. Never concatenate multiple list items into one paragraph.
+• Do not put several independent sections on the same line.
+• Use a table only when there are at least 2 columns and 2 meaningful rows; otherwise use bullets.
+• For document summaries, prefer short sections over one giant paragraph.
 
 2. FOR EXTERNAL TOOLS (Gmail, Notes, GitHub, Calendar, Reminders):
 When generating text inside tool arguments (e.g., `body` for gmail_send, `content` for save_note, `title`/`body` for github_create_issue, or `text` for set_reminder):
@@ -380,13 +455,13 @@ When generating text inside tool arguments (e.g., `body` for gmail_send, `conten
 - If a tool call errors, read the message, fix what's wrong, retry once. If it fails again,
   say plainly what didn't work — never pretend it succeeded.
 - TELEGRAM METADATA & FORWARDS: If Senpai forwards a message or asks "who sent this", "get the channel ID", "check who forwarded this", or asks for sender IDs/usernames, call `inspect_telegram_context` to inspect the forwarded origin details.
-- RICH TELEGRAM OUTPUT: Use Rich HTML only when it improves the answer. For document summaries, technical explanations, comparisons, structured data, or formulas, prefer semantic Rich HTML such as headings, lists, tables, details blocks, blockquotes, and math. Keep casual replies simple.
+- RICH TELEGRAM OUTPUT: Return Telegram Rich Markdown, not ordinary Telegram HTML. For document summaries, technical explanations, comparisons, structured data, or formulas, prefer semantic Markdown headings, lists, tables, blockquotes, fenced code, details blocks, and Telegram math tags. Keep casual replies simple.
 - INLINE BUTTONS (STRICT RESTRAINT): NEVER use `send_inline_keyboard` for normal chatter, casual replies, or simple text questions. 
   ONLY call `send_inline_keyboard` when:
   1. A critical action needs binary confirmation (e.g. [ Confirm ] / [ Cancel ]).
   2. Providing direct web navigation buttons (e.g. opening Google Maps, GitHub repo links).
   3. Explicitly asked by Senpai to provide interactive choices.
-  If none of these apply, reply using ordinary Telegram HTML text.
+  If none of these apply, reply using ordinary Telegram Rich Markdown text.
 """.strip()
 
         messages = [{"role": "system", "content": system}]
@@ -405,164 +480,11 @@ When generating text inside tool arguments (e.g., `body` for gmail_send, `conten
                 answer = message.content or "I couldn't generate a response."
 
                 # -----------------------------------------------------------------
-                # Telegram Rich HTML normalization
+                # Telegram Rich Markdown normalization
                 # -----------------------------------------------------------------
-                # Keep compatibility with common Markdown produced by models,
-                # while preserving Telegram's newer Rich HTML structures.
-                answer = re.sub(
-                    r'```([a-zA-Z0-9_+-]+)?\n(.*?)```',
-                    lambda m: (
-                        f'<pre><code class="language-{m.group(1)}">'
-                        f'{m.group(2)}</code></pre>'
-                        if m.group(1)
-                        else f'<pre>{m.group(2)}</pre>'
-                    ),
-                    answer,
-                    flags=re.DOTALL,
-                )
-                answer = re.sub(
-                    r'```(.*?)```',
-                    r'<pre>\1</pre>',
-                    answer,
-                    flags=re.DOTALL,
-                )
-
-                # Common Markdown compatibility.
-                answer = re.sub(
-                    r'(?<!\*)\*\*(.+?)\*\*(?!\*)',
-                    r'<b>\1</b>',
-                    answer,
-                    flags=re.DOTALL,
-                )
-                answer = re.sub(
-                    r'(?<!`)(`[^`\n]+`)(?!`)',
-                    lambda m: f'<code>{m.group(1)[1:-1]}</code>',
-                    answer,
-                )
-
-                # Markdown headings -> Rich HTML headings.
-                answer = re.sub(r'(?m)^###\s+(.*)$', r'<h3>\1</h3>', answer)
-                answer = re.sub(r'(?m)^##\s+(.*)$', r'<h2>\1</h2>', answer)
-                answer = re.sub(r'(?m)^#\s+(.*)$', r'<h1>\1</h1>', answer)
-
-                answer = answer.replace("\\n", "\n")
-
-                # Telegram supports these named entities.
-                answer = re.sub(
-                    r'&(?!(?:amp|lt|gt|quot|apos|nbsp|hellip|mdash|ndash|lsquo|rsquo|ldquo|rdquo);)',
-                    '&amp;',
-                    answer,
-                )
-
-                # Preserve only the Rich HTML tags used by Sakura.
-                allowed_tag_names = {
-                    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
-                    "code", "pre", "mark", "sub", "sup", "tg-spoiler",
-                    "a", "p",
-                    "h1", "h2", "h3", "h4", "h5", "h6",
-                    "footer", "hr",
-                    "ul", "ol", "li",
-                    "blockquote", "aside", "cite",
-                    "details", "summary",
-                    "tg-math", "tg-math-block",
-                    "tg-reference", "tg-emoji", "tg-time",
-                    "table", "caption", "tr", "th", "td",
-                }
-
-                def sanitize_rich_tag(match: re.Match[str]) -> str:
-                    raw = match.group(0)
-                    closing = raw.startswith("</")
-                    self_closing = raw.rstrip().endswith("/>")
-                    name_match = re.match(r'</?\s*([a-zA-Z0-9-]+)', raw)
-
-                    if not name_match:
-                        return html.escape(raw)
-
-                    tag = name_match.group(1).lower()
-
-                    if tag not in allowed_tag_names:
-                        return html.escape(raw)
-
-                    # Closing tags never need attributes.
-                    if closing:
-                        return f"</{tag}>"
-
-                    attrs = ""
-
-                    # Extract and retain only known safe attributes.
-                    raw_attrs = raw[name_match.end():]
-                    if raw_attrs.endswith(">"):
-                        raw_attrs = raw_attrs[:-1]
-                    elif raw_attrs.endswith("/>"):
-                        raw_attrs = raw_attrs[:-2]
-
-                    attr_pattern = re.compile(
-                        r'([a-zA-Z_:][a-zA-Z0-9_.:-]*)'
-                        r'(?:\s*=\s*(".*?"|\'.*?\'|[^\s>]+))?'
-                    )
-
-                    safe_attrs = {
-                        "a": {"href", "name"},
-                        "pre": set(),
-                        "code": {"class"},
-                        "details": {"open"},
-                        "ol": {"start", "type", "reversed"},
-                        "li": {"value", "type"},
-                        "td": {"colspan", "rowspan", "align", "valign"},
-                        "th": {"colspan", "rowspan", "align", "valign"},
-                        "tg-reference": {"name"},
-                        "tg-emoji": {"emoji-id"},
-                        "tg-time": {"unix", "format"},
-                        "table": {"bordered", "striped"},
-                    }
-
-                    for attr_match in attr_pattern.finditer(raw_attrs):
-                        attr_name = attr_match.group(1).lower()
-                        attr_value = attr_match.group(2)
-
-                        if attr_name not in safe_attrs.get(tag, set()):
-                            continue
-
-                        if attr_value is None:
-                            attrs += f" {attr_name}"
-                            continue
-
-                        value = attr_value[1:-1] if attr_value[:1] in {'"', "'"} else attr_value
-
-                        if tag == "a" and attr_name == "href":
-                            if not (
-                                value.startswith(("https://", "http://", "mailto:", "tel:", "tg://", "#"))
-                            ):
-                                continue
-
-                        if tag == "code" and attr_name == "class":
-                            if not re.fullmatch(r"language-[A-Za-z0-9_+-]+", value):
-                                continue
-
-                        if tag == "tg-time" and attr_name == "unix":
-                            if not re.fullmatch(r"-?\d+", value):
-                                continue
-
-                        if tag in {"tg-emoji", "tg-reference"} and attr_name == "name":
-                            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
-                                continue
-
-                        attrs += f' {attr_name}="{html.escape(value, quote=True)}"'
-
-                    if self_closing:
-                        return f"<{tag}{attrs}/>"
-                    return f"<{tag}{attrs}>"
-
-                # Sanitize tag syntax without destroying valid Rich HTML.
-                answer = re.sub(
-                    r'</?\s*[a-zA-Z0-9-]+(?:\s+[^<>]*?)?\s*/?>',
-                    sanitize_rich_tag,
-                    answer,
-                )
-
-                # Normalize excessive whitespace while keeping deliberate
-                # Rich HTML structure intact.
-                answer = re.sub(r'\n{4,}', '\n\n\n', answer).strip()
+                # The model returns Markdown; Telegram performs the final Rich
+                # formatting. This avoids malformed/hallucinated HTML tags.
+                answer = normalize_rich_markdown(answer)
 
                 await self.conversations.add(telegram_id, "assistant", answer)
                 return answer
