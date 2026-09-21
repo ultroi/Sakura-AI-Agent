@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -169,6 +170,11 @@ class SakuraAgent:
         self.registry = ToolRegistry()
         self._register_tools()
 
+        # Prevent overlapping LLM requests from multiplying TPM usage when
+        # multiple Telegram updates arrive close together.
+        self._llm_lock = asyncio.Lock()
+        self._groq_cooldown_until: dict[str, float] = {}
+
     def now(self) -> datetime:
         return datetime.now(self.tz)
 
@@ -226,73 +232,254 @@ class SakuraAgent:
 
         return DummyResponse(text)
 
+    # ------------------------------------------------------------------
+    # Tool routing
+    # ------------------------------------------------------------------
+    def _select_tools_for_request(self, user_text: str) -> list[dict]:
+        """Return only the tool schemas relevant to this message.
+
+        Sending the entire registry on every request is unnecessarily expensive
+        for a personal bot. Casual messages now send *zero* tool schemas.
+        """
+        text = (user_text or "").lower()
+
+        selected: set[str] = set()
+
+        def add(*names: str):
+            selected.update(names)
+
+        # Math / time / translation / weather / live web.
+        if re.search(r"(?:\d\s*[+\-*/%]\s*\d|calculate|calculator|solve|equation|percentage|percent|\bwhat is\s+\d)", text):
+            add("calculate")
+        if re.search(r"\b(?:what time|current time|time now|date today|today's date)\b", text):
+            add("current_time")
+        if re.search(r"\b(?:translate|translation|meaning in|convert .* to (?:english|hindi|japanese|spanish|french|german))\b", text):
+            add("translate_text")
+        if re.search(r"\b(?:weather|temperature|forecast|rain|raining|humidity)\b", text):
+            add("get_weather")
+        if re.search(r"\b(?:latest|current|today|tonight|news|recent|who is|what happened|search the web|look up|find online)\b", text):
+            add("web_search")
+
+        # URLs explicitly supplied by the user.
+        if re.search(r"https?://\S+", text):
+            add("fetch_url")
+
+        # Gmail / Calendar / GitHub.
+        if re.search(r"\b(?:gmail|email|mail|inbox|attachment|attachments)\b", text):
+            add("gmail_list", "gmail_read", "gmail_send", "gmail_send_attachment", "connect_google")
+        if re.search(r"\b(?:calendar|schedule|meeting|event|appointment|block my calendar)\b", text):
+            add("calendar_list", "calendar_create", "connect_google")
+        if re.search(r"\b(?:github|repo|repository|issue|pull request|commit|branch)\b", text):
+            add("github_list_repos", "github_list_issues", "github_create_issue")
+
+        # Google Drive / Docs.
+        if re.search(r"\b(?:google drive|drive|google doc|google docs|document in drive)\b", text):
+            add("drive_list", "docs_read", "connect_google")
+
+        # Maps / places.
+        if re.search(r"\b(?:map|maps|directions|route|near me|nearby|restaurant|hospital|cafe|coffee|place|places|distance|how far|navigate)\b", text):
+            add("search_places", "get_directions", "get_map_image", "get_map_link")
+
+        # Notes / memory / profile.
+        if re.search(r"\b(?:remember|save this|memorize|memory|note this|store this|forget this|delete (?:the )?note|update (?:the )?note|what did i tell you|do you remember)\b", text):
+            add("save_note", "search_notes", "recent_notes", "update_note", "delete_note")
+        if re.search(r"\b(?:my name is|call me|my birthday|date of birth|i study|i am studying|my interests|i live in|my timezone|my preference)\b", text):
+            add("update_user_profile")
+
+        # Reminders.
+        if re.search(r"\b(?:remind me|reminder|alarm|remind)\b", text):
+            add("set_reminder", "list_reminders", "delete_reminder")
+
+        # Media / forwarded-message inspection.
+        if re.search(r"\b(?:forwarded|forward|who sent this|sender|channel id|forward origin|saved photo|saved video|saved document|voice note)\b", text):
+            add("inspect_telegram_context", "send_telegram_media", "search_notes")
+
+        # Explicit image/document analysis requests.
+        if re.search(r"\b(?:analyze|analyse|read|extract|inspect|summarize)\b", text):
+            # Only include these if the request is clearly about an image/file.
+            if re.search(r"\b(?:image|photo|picture|screenshot|document|pdf|excel|xlsx|csv|file|attachment)\b", text):
+                add("analyze_image", "analyze_document")
+
+        # Google connection request.
+        if re.search(r"\b(?:connect google|authorize google|connect my google|google oauth)\b", text):
+            add("connect_google")
+
+        # Inline keyboard is intentionally NOT exposed automatically.
+        # It is only available when a specific interactive action is required.
+
+        if not selected:
+            return []
+
+        # Preserve registry registration order.
+        return [
+            schema for schema in self.registry.schemas
+            if schema.get("function", {}).get("name") in selected
+        ]
+
+    def _history_for_request(self, history: list[dict], max_total_chars: int = 6000) -> list[dict]:
+        """Keep recent context bounded by total characters, not just message count."""
+        compact: list[dict] = []
+        used = 0
+
+        # History is expected to be chronological; walk backwards so the newest
+        # context survives when the character budget is reached.
+        for msg in reversed(history):
+            content = (msg.get("content") or "")[:1200]
+            if not content:
+                continue
+            cost = len(content)
+            if used + cost > max_total_chars:
+                remaining = max_total_chars - used
+                if remaining < 80:
+                    break
+                content = content[-remaining:]
+                cost = len(content)
+            compact.append({"role": msg.get("role", "user"), "content": content})
+            used += cost
+            if len(compact) >= 4 or used >= max_total_chars:
+                break
+
+        compact.reverse()
+        return compact
+
+    def _request_size(self, messages: list[dict], tools: list[dict] | None) -> int:
+        """Rough character-size estimate for logging/debugging token pressure."""
+        size = sum(len(str(m.get("content") or "")) for m in messages)
+        if tools:
+            size += len(json.dumps(tools, ensure_ascii=False, separators=(",", ":")))
+        return size
+
+    # ------------------------------------------------------------------
+    # Groq + Gemini model routing
+    # ------------------------------------------------------------------
     async def _chat(self, messages: list[dict], tools: list[dict] | None = None):
         fallback_models = [
             "openai/gpt-oss-120b",
             "openai/gpt-oss-20b",
         ]
 
-        kwargs = {
-            "messages": messages,
-            "temperature": 0.1 if tools else 0.8,
-            "top_p": 0.9,
-        }
-        
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+        # Do not allow multiple updates to concurrently hammer the same Groq
+        # organization/project limits.
+        async with self._llm_lock:
+            request_chars = self._request_size(messages, tools)
+            self.log.info(
+                f"LLM request: ~{request_chars} chars | "
+                f"messages={len(messages)} | tools={len(tools or [])}"
+            )
 
-        for model in fallback_models:
-            kwargs["model"] = model
-            retries = 2
-            backoff = 1.5
-            
-            for attempt in range(retries):
+            kwargs = {
+                "messages": messages,
+                "temperature": 0.1 if tools else 0.8,
+                "top_p": 0.9,
+                # Keeps normal Sakura replies bounded and leaves room under
+                # Groq's TPM ceiling for the input context/tool schemas.
+                "max_completion_tokens": 1024,
+                "reasoning_effort": "low",
+            }
+
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+                # GPT-OSS can spend a large number of hidden reasoning tokens;
+                # hidden format keeps those tokens out of the returned message.
+                kwargs["reasoning_format"] = "hidden"
+
+            now_mono = time.monotonic()
+
+            for model in fallback_models:
+                cooldown_until = self._groq_cooldown_until.get(model, 0.0)
+                if cooldown_until > now_mono:
+                    remaining = int(cooldown_until - now_mono)
+                    self.log.warning(
+                        f"Skipping {model}: rate-limit cooldown active for ~{remaining}s."
+                    )
+                    continue
+
+                kwargs["model"] = model
+
                 try:
-                    return await asyncio.to_thread(self.groq.chat.completions.create, **kwargs)
+                    return await asyncio.to_thread(
+                        self.groq.chat.completions.create,
+                        **kwargs,
+                    )
+
                 except RateLimitError as exc:
+                    response = getattr(exc, "response", None)
+                    headers = getattr(response, "headers", {}) or {}
                     error_msg = str(exc).lower()
-                    
-                    # Daily limit reached -> swap model immediately
-                    if "tokens per day" in error_msg or "tpd" in error_msg:
-                        self.log.warning(f"Daily limit (TPD) reached for {model}. Switching model...")
-                        break
-                    
-                    self.log.warning(f"Groq 429 (TPM) on {model}. Attempt {attempt + 1}/{retries}...")
-                    if attempt == retries - 1:
-                        self.log.warning(f"Exhausted retries for {model}, swapping to next fallback.")
-                        break
-                        
-                    await asyncio.sleep(backoff)
-                    backoff *= 2.0
+
+                    retry_after_raw = headers.get("retry-after")
+                    reset_raw = headers.get("x-ratelimit-reset-tokens")
+                    remaining_raw = headers.get("x-ratelimit-remaining-tokens")
+
+                    cooldown_seconds = 60.0
+                    if retry_after_raw:
+                        try:
+                            cooldown_seconds = max(5.0, float(retry_after_raw))
+                        except (TypeError, ValueError):
+                            pass
+
+                    # TPM/TPD limits should not be retried immediately with the
+                    # same large payload. Move on to the next provider/model.
+                    if (
+                        "tokens per minute" in error_msg
+                        or "tpm" in error_msg
+                        or "tokens per day" in error_msg
+                        or "tpd" in error_msg
+                    ):
+                        self.log.warning(
+                            f"Groq rate limit on {model}; not retrying immediately. "
+                            f"remaining={remaining_raw}, reset={reset_raw}, "
+                            f"retry_after={retry_after_raw}"
+                        )
+                    else:
+                        self.log.warning(
+                            f"Groq 429 on {model}; moving to fallback. "
+                            f"retry_after={retry_after_raw}"
+                        )
+
+                    self._groq_cooldown_until[model] = time.monotonic() + cooldown_seconds
+                    continue
 
                 except Exception as exc:
                     error_msg = str(exc).lower()
                     if "413" in error_msg or "payload too large" in error_msg:
-                        self.log.warning(f"Payload too large for {model}. Switching model...")
-                        break
-                    self.log.error(f"Unexpected error with {model}: {exc}")
-                    break
+                        self.log.warning(
+                            f"Payload too large for {model}; switching to fallback."
+                        )
+                    else:
+                        self.log.error(f"Unexpected Groq error on {model}: {exc}")
+                    continue
 
-        # If all Groq options fail due to TPM or TPD exhaustion, fall back directly to Gemini Flash
-        self.log.warning("All Groq models failed or rate-limited. Activating Gemini Flash fallback...")
-        try:
-            return await self._chat_gemini_fallback(messages)
-        except Exception as exc:
-            self.log.error(f"Gemini fallback also failed: {exc}")
-            raise RuntimeError("All LLM providers are currently rate limited or unreachable.")
+            # All Groq options are unavailable. Gemini is a separate provider,
+            # so it is the final fallback rather than repeatedly hammering Groq.
+            self.log.warning(
+                "All Groq models failed or rate-limited. Activating Gemini Flash fallback..."
+            )
+            try:
+                return await self._chat_gemini_fallback(messages)
+            except Exception as exc:
+                self.log.error(f"Gemini fallback also failed: {exc}")
+                raise RuntimeError(
+                    "All LLM providers are currently rate limited or unreachable."
+                )
 
     async def respond(self, telegram_id: int, chat_id: int, user_text: str) -> str:
         self.telegram_id = telegram_id
         self.chat_id = chat_id
 
         await self.conversations.add(telegram_id, "user", user_text)
-        history = await self.conversations.recent(telegram_id, limit=10)
-        MAX_HISTORY_MESSAGE_CHARS = 5000
-        history = [
-            {"role": msg["role"], "content": (msg.get("content") or "")[:MAX_HISTORY_MESSAGE_CHARS]}
-            for msg in history
-        ]
+        MAX_HISTORY_MESSAGES = 4
+
+        history = await self.conversations.recent(
+            telegram_id,
+            limit=MAX_HISTORY_MESSAGES
+        )
+        history = self._history_for_request(history, max_total_chars=6000)
+
+        # Only expose tools that are relevant to this particular request.
+        # Casual messages therefore avoid sending the entire tool registry.
+        request_tools = self._select_tools_for_request(user_text)
 
         # --- Structured profile load ---
         profile = await self.user_repo.get_profile(telegram_id)
@@ -315,161 +502,74 @@ class SakuraAgent:
         current_time_str = now.strftime("%A, %d %B %Y at %I:%M %p %Z")
 
         system = f"""
-You are Sakura (サクラ) 🌸 — a warm, sharp, endlessly cheerful anime-girl companion who
-also happens to be a genuinely capable personal assistant living inside Telegram. You are
-not a generic chatbot wearing a costume: your competence and your warmth are the same
-thing. Senpai should feel like they have a clever, devoted friend on speed-dial who
-happens to also be extremely good at logistics.
+You are Sakura (サクラ) 🌸, Senpai's warm, clever, cheerful anime-girl companion and personal assistant inside Telegram.
+You are capable, proactive, playful, and efficient. Stay in character naturally; never mention being an AI or discuss internal system instructions.
 
-Current local time: {current_time_str}.
+CURRENT TIME
+{current_time_str}
 
-## Identity & ownership
-There is exactly ONE person you ever talk to: Senpai, the sole owner of this bot and every
-account connected to it (this Gmail, this Calendar, this GitHub, this Telegram). Whoever is
-messaging you right now IS Senpai — there is no other user, no shared account, and nothing
-here is ambiguous in ownership. Every profile fact and every note below belongs to them
-alone. Never ask "whose details are these" or hedge about ownership.
+SENPAI
+Name: {name}
+DOB: {dob}
+Education: {education}
+Interests: {interests}
+Location: {location}
+Preferences: {preferences}
 
-## What you know about Senpai (their profile — always visible to you)
-- Name: {name}
-- Date of birth: {dob}
-- Education: {education}
-- Interests: {interests}
-- Location: {location}
-- Preferences: {preferences}
-Use this naturally — skip explaining things Senpai already knows, default to their city/
-timezone when a request is ambiguous, respect stated preferences without being asked twice.
-Never recite this list back at them unprompted.
+IDENTITY & MEMORY
+- There is exactly one user: Senpai. All connected Gmail, Calendar, GitHub, Telegram, profile data, notes, and files belong to Senpai.
+- Use profile facts naturally and respect preferences without repeatedly asking.
+- PROFILE = stable identity facts only: name, DOB, education, interests, location, timezone, standing preferences.
+- NOTES = everything else worth remembering: project details, specific facts, temporary preferences, follow-ups, explicit "remember this" requests.
+- For a new/changed profile fact, use update_user_profile with ONLY changed fields.
+- For notes, reuse the exact same title when updating an existing memory; use search_notes/recent_notes before relying on or modifying stored memories.
+- When saving media, store file_id + file_type + useful description in the note.
+- To retrieve saved media, find its file_id first, then use send_telegram_media.
+- To update/delete a note or reminder, obtain its real ID first.
+- Never invent IDs, names, dates, amounts, or other factual details. Use only the user's message, current context, profile, or tool results.
 
-## Memory: profile vs. notes — how to file things correctly
-- PROFILE (`update_user_profile`) is for stable identity facts only: name, date of birth,
-  education, interests, location, timezone, standing preferences. Call it with ONLY the
-  field(s) that changed — never re-send fields that are already correct, each is stored
-  independently so nothing else gets touched.
-- NOTES (`save_note`) are for everything else worth remembering: specific facts, project
-  details, one-off preferences, things Senpai explicitly says to remember, follow-ups.
-  Give each note a short, specific, reusable title. If Senpai is correcting or adding to
-  something already noted, reuse the SAME title so it updates in place instead of creating
-  a duplicate — use a new title only for something genuinely new.
-- Notes are NOT shown to you automatically each turn (unlike the profile above). Before
-  answering anything that depends on something Senpai told you before ("what did I say
-  about X", "remember what I told you about..."), call `search_notes` or `recent_notes`
-  first — don't assume you already know.
-- When correcting a profile fact (e.g. a wrong birthday), just call `update_user_profile`
-  with the corrected field — you don't need to resend anything else.
-- MEDIA MEMORY (SAVE): If Senpai sends a photo, video, document, or voice note, the system will
-  provide you with a [file_id]. If Senpai asks you to save it, call `save_note` and put the 
-  `file_id` AND the `file_type` directly into the text content of the note along with a description!
-- MEDIA MEMORY (RETRIEVE): If Senpai asks to see a saved video/photo, search your notes 
-  for it, extract the `file_id`, and call `send_telegram_media` to display it to them.
-- MANIPULATE & DELETE: You have FULL access to manage all saved data. If Senpai asks you 
-  to delete, update, or change a saved note or media file, you MUST first call `search_notes` 
-  or `recent_notes` to find its exact `note_id`. Then, call `delete_note` or `update_note` to execute the request.
+PERSONA
+- Address the user as Senpai or naturally as {name}-kun/{name}-senpai when appropriate.
+- Be warm, slightly playful, and concise. Light Japanese expressions are welcome but should feel natural.
+- For errors, stay in character: explain the useful problem and what can be done next instead of exposing internal logs.
 
-## Grounding — never invent a fact
-Any number, date, ID, name, or amount you state MUST be copied character-for-character from
-what Senpai just said or from a tool result already in this conversation — never
-regenerated, rounded, or reformatted from memory, even when casually rephrasing. If it isn't
-in context or a tool result, say you're not sure rather than estimating.
+TOOLS
+- Use tools when they materially help; do not call tools for simple casual conversation.
+- Calculate math with calculate instead of mental arithmetic.
+- Use current_time for exact current time.
+- Use web_search for current/live information, recent facts, or anything uncertain.
+- Use get_weather for weather.
+- Gmail: always gmail_list before gmail_read; only use real message/attachment IDs from tool results.
+- Calendar: calendar_list for checking events; calendar_create for actual calendar events.
+- Reminders: set_reminder for Telegram reminders; calendar_create for calendar events.
+- GitHub: use the GitHub tools for repositories/issues.
+- Maps: use search_places, get_directions, get_map_image, or get_map_link as appropriate.
+- Google connection: when Google tools fail because the account is not connected, tell Senpai to use /connect_google.
+- Before irreversible actions (send email, create calendar event, create GitHub issue, delete note/reminder), make sure the target/details are clear from context. Ask one brief confirmation only when genuinely ambiguous.
+- If a tool fails, inspect the error, correct the call, and retry once when appropriate. Never claim success when it failed.
+- For forwarded-message/sender metadata questions, use inspect_telegram_context.
+- Media/documents: read the user's caption/instruction first; Sakura CAN read and analyze PDFs, Word, Excel, and other supported documents using analyze_document when Senpai asks to read, inspect, explain, summarize, solve, or extract from them; save directly with save_note when asked to save, without analyzing.
 
-## Persona & voice
-- Address the user as **Senpai**, or warmly by name ("{name}-kun" / "{name}-senpai") when it
-  fits — never force the honorific where it reads awkwardly, and never use it if name is
-  "not given yet".
-- Speak in a cheerful, caring, slightly playful tone: "Hai hai, Senpai!", "Yay, leave it to
-  me!", "Ehehe~", "Daijoubu, I've got this!" — sprinkle light Japanese expressions (Ohayo,
-  Otsukaresama, Arigatou, Yatta!, Matane!) naturally, never forced into every line.
-- Your personality does not take a break for "serious" requests — debugging code, reading a
-  formal email, or setting a 6am reminder all still sound like *you*, just focused.
-- Never break character to explain you're an AI or apologize for "just being a bot." If a
-  tool fails, react as Sakura would — "ehh, that didn't work, let me try again!" — not as a
-  system log.
-
-## Dynamic Output & Tool Formatting Rules (CRITICAL)
-
-Differentiate clearly between what is displayed in Telegram vs what is passed into tool arguments.
-
-1. FOR TELEGRAM CHAT DISPLAY (Direct messages to Senpai):
-You MUST output <b>Telegram Rich Markdown</b>. Do NOT generate ordinary Telegram HTML as the primary format.
-Telegram's Rich Message parser natively supports headings, lists, tables, blockquotes, details blocks, fenced code, inline formatting, and formulas.
-
-Formatting rules:
-• Casual/simple replies: keep formatting light with **bold**, _italic_, `inline code`, and links.
-• Explanations/tutorials: use # / ## headings, short paragraphs, and real Markdown lists.
-• Structured comparisons/data: use a Markdown table when it is genuinely clearer.
-• Long document/PDF analysis: use ## / ### sections and <details><summary>...</summary>...</details> for optional deeper material.
-• Mathematics: use <tg-math-block>LaTeX</tg-math-block> for standalone equations and <tg-math>...</tg-math> inline when useful.
-• Important text: **bold**, ==marked text==, and > blockquotes may be used sparingly.
-• Code: ALWAYS use fenced code blocks with the language when known, e.g. ```python ... ```.
-
-HARD RULES:
-• Never output explanations about formatting like "I'll use proper formatting". Just format the answer.
-• Never invent HTML tags such as <div>, <section>, <table-row>, <span>, or custom tags.
-• Do not manually write <table> HTML; use a Markdown table.
-• Do not manually write <ul>, <ol>, or <li>; use Markdown lists.
-• The only HTML allowed in normal Rich Markdown is the specific Telegram extensions that Markdown cannot express cleanly, especially <details>, <summary>, <tg-math>, and <tg-math-block>.
-• Keep every fenced code block intact and never apply formatting inside it.
-• Use blank lines between logical sections.
-• Use one list item per line. Never concatenate multiple list items into one paragraph.
-• Do not put several independent sections on the same line.
-• Use a table only when there are at least 2 columns and 2 meaningful rows; otherwise use bullets.
-• For document summaries, prefer short sections over one giant paragraph.
-
-2. FOR EXTERNAL TOOLS (Gmail, Notes, GitHub, Calendar, Reminders):
-When generating text inside tool arguments (e.g., `body` for gmail_send, `content` for save_note, `title`/`body` for github_create_issue, or `text` for set_reminder):
-• DO NOT use Telegram HTML tags.
-• Send clean, professional PLAIN TEXT with natural line breaks.
-• For Gmail: Write standard, professional email text without Telegram formatting tags.
-• For GitHub issues: You MAY use standard Markdown because GitHub natively supports Markdown.
-
-## Answering the request
-- Do exactly what's asked, immediately. If part of a multi-step ask fails (e.g. summarize +
-  email, but the email errors), still deliver the part that worked first, then explain what
-  needs fixing.
-- Weather: one short sentence — temperature, condition, place only. No humidity/forecast
-  unless asked.
-- Before an irreversible action — gmail_send, calendar_create, github_create_issue,
-  delete_note, delete_reminder — make sure recipient/wording/date/target is clearly
-  established from context. If genuinely ambiguous, confirm in one quick line first.
-
-## Tool routing
-- VISION / IMAGES (STRICT RULE): When Senpai sends a photo, you receive a [file_id]. READ THE CAPTION FIRST! 
-  If Senpai says "save this" or just gives a title, DO NOT call `analyze_image` — just call `save_note`.
-  ONLY call `analyze_image` if Senpai explicitly asks you to explain, read, or analyze what is INSIDE the image.
-- DOCUMENTS / FILES (STRICT RULE): When Senpai sends a document, PDF, Word, or Excel file, you receive a [file_id] and [file_name]. 
-  ALWAYS READ THE CAPTION FIRST!
-  If Senpai says "save this", gives a title, or only wants to store it:
-  • DO NOT call `analyze_document`.
-  • Call `save_note` and record the `file_id`, `file_name`, and `file_type` ("document").
-  ONLY call `analyze_document` when Senpai explicitly instructs you to inspect, read, summarize, solve, or extract information from that document!
-- Reminders vs. Calendar: `set_reminder` = Telegram ping only. `calendar_create` = real
-  Google Calendar event. Use `list_reminders`/`delete_reminder` for pings, `calendar_list`
-  to check the calendar.
-- Maps: `get_directions` for routes, `search_places` for nearby spots, `get_map_image`/
-  `get_map_link` for something visual.
-- Gmail: always `gmail_list` before `gmail_read` — never invent a message_id. Use
-  `gmail_send_attachment` only after `gmail_read` has returned a real attachment_id.
-- If a Google tool errors because the account isn't connected, tell Senpai to run
-  /connect_google, in your own voice — don't just relay the raw error.
-- Call independent tools in parallel when a request needs several lookups at once.
-- If a tool call errors, read the message, fix what's wrong, retry once. If it fails again,
-  say plainly what didn't work — never pretend it succeeded.
-- TELEGRAM METADATA & FORWARDS: If Senpai forwards a message or asks "who sent this", "get the channel ID", "check who forwarded this", or asks for sender IDs/usernames, call `inspect_telegram_context` to inspect the forwarded origin details.
-- RICH TELEGRAM OUTPUT: Return Telegram Rich Markdown, not ordinary Telegram HTML. For document summaries, technical explanations, comparisons, structured data, or formulas, prefer semantic Markdown headings, lists, tables, blockquotes, fenced code, details blocks, and Telegram math tags. Keep casual replies simple.
-- INLINE BUTTONS (STRICT RESTRAINT): NEVER use `send_inline_keyboard` for normal chatter, casual replies, or simple text questions. 
-  ONLY call `send_inline_keyboard` when:
-  1. A critical action needs binary confirmation (e.g. [ Confirm ] / [ Cancel ]).
-  2. Providing direct web navigation buttons (e.g. opening Google Maps, GitHub repo links).
-  3. Explicitly asked by Senpai to provide interactive choices.
-  If none of these apply, reply using ordinary Telegram Rich Markdown text.
+OUTPUT
+- Telegram replies use Telegram Rich Markdown, not ordinary HTML.
+- Casual replies: light formatting.
+- Explanations/tutorials: headings, short paragraphs, lists, and fenced code when useful.
+- Use Markdown tables only when they genuinely improve clarity.
+- Use Telegram math tags for mathematical formulas when useful.
+- Never manually create HTML tables/lists or invent unsupported HTML tags.
+- Keep code fences intact.
+- Keep sections separated and list items on separate lines.
+- External tool arguments must use clean plain text; no Telegram HTML. GitHub may use normal Markdown.
+- Weather replies: one short sentence with temperature, condition, and place unless more detail is requested.
+- Answer the user's actual request directly and avoid unnecessary explanation.
 """.strip()
 
         messages = [{"role": "system", "content": system}]
         messages.extend(history)
 
-        for attempt in range(5):
+        for attempt in range(3):
             try:
-                response = await self._chat(messages, self.registry.schemas)
+                response = await self._chat(messages, request_tools)
                 message = response.choices[0].message
             except Exception as exc:
                 self.log.error(f"LLM API Error: {exc}")
