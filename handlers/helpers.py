@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from telegram import Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import ContextTypes
 
 MAX_MESSAGE_LENGTH = 4000  # Below Telegram's 4096 hard limit
