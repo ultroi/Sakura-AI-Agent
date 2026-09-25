@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
-from handlers.helpers import is_owner, send_response_safely
+from handlers.helpers import is_owner, send_response_safely, should_sakura_reply
 
 # =============================================================================
 # CONFIG
@@ -359,6 +359,9 @@ async def deliver_final_response(
             )
 
 
+
+
+
 # =============================================================================
 # MESSAGE HANDLERS
 # =============================================================================
@@ -374,32 +377,19 @@ async def text_handler(
     if not update.message:
         return
 
-    if not is_owner(update, context):
-        await update.message.reply_text(
-            "🌸 This is a private assistant.",
-        )
+    if not should_sakura_reply(update, context):
         return
 
     agent = context.application.bot_data["agent"]
     chat = update.effective_chat
 
-    # -------------------------------------------------------------------------
-    # Cache current message for metadata/forward inspection
-    # -------------------------------------------------------------------------
     agent.current_message = update.effective_message
 
-    # -------------------------------------------------------------------------
-    # Extract text/caption
-    # -------------------------------------------------------------------------
     user_text = (
         update.message.text
         or update.message.caption
         or ""
     )
-
-    # -------------------------------------------------------------------------
-    # Extract replied-message context
-    # -------------------------------------------------------------------------
     reply_info = ""
 
     if update.message.reply_to_message:
@@ -463,9 +453,6 @@ async def text_handler(
                 f"message: '{replied_text}']\n"
             )
 
-    # -------------------------------------------------------------------------
-    # Extract media info from current message
-    # -------------------------------------------------------------------------
     media_info = ""
 
     if update.message.photo:

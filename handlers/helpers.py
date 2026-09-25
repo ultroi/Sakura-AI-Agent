@@ -47,6 +47,32 @@ def chunk_text(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
 
     return chunks
 
+def should_sakura_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    message = update.message
+    if not chat or not message:
+        return False
+
+    # Private chat me hamesha reply karegi
+    if chat.type == ChatType.PRIVATE:
+        return True
+
+    # Group / Supergroup logic
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        # Agar message owner ka nahi hai, toh ignore karo
+        if not is_owner(update, context):
+            return False
+
+        # Owner ka message hai, ab text/caption check karo ki "sakura" word hai ya nahi
+        text = (message.text or message.caption or "").lower()
+        
+        # Check if "sakura" is in text or if bot's username is mentioned
+        bot_username = context.bot.username.lower() if context.bot.username else "sakura"
+        if "sakura" in text or f"@{bot_username}" in text:
+            return True
+
+    return False
+
 
 async def send_response_safely(message_to_edit, full_text: str, chat):
     """Edits the placeholder message with the first chunk, and sends any overflow chunks as new messages."""
