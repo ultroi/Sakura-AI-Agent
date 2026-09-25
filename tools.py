@@ -766,7 +766,6 @@ def register_tools(agent):
             if not hasattr(agent, "bot"):
                 return "Error: Telegram bot not connected."
             
-            # Clean file_id just in case the LLM added hidden spaces/newlines
             file_id = file_id.strip()
             
             # --- STEP 1: Download from Telegram ---
@@ -778,8 +777,8 @@ def register_tools(agent):
                 return f"Telegram File Download Error: Could not fetch image from Telegram. Details: {e}"
             
             # --- STEP 2: Send to Gemini ---
-            # Using the universally supported 'gemini-1.5-flash-latest' endpoint
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+            # Updated to match the latest gemini-3.8-flash model
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
             payload = {
                 "contents": [{
                     "parts": [
@@ -795,7 +794,6 @@ def register_tools(agent):
                 headers={"Content-Type": "application/json"}
             )
             
-            # Catch raw HTTP errors from Google and return the exact text
             if response.status_code != 200:
                 return f"Gemini API Error {response.status_code}: {response.text}"
                 
@@ -815,10 +813,11 @@ def register_tools(agent):
                 "file_name": {"type": "string", "description": "The filename with extension (e.g. report.pdf, data.xlsx)."},
                 "prompt": {"type": "string", "description": "What specific information or analysis to extract from the document."}
             },
-            "required": ["file_id"]
+            # FIX: Made file_name required so mimetypes can accurately guess the file format.
+            "required": ["file_id", "file_name"]
         },
     )
-    async def _analyze_document(file_id: str, file_name: str = "", prompt: str = "Summarize and extract key information from this document."):
+    async def _analyze_document(file_id: str, file_name: str, prompt: str = "Summarize and extract key information from this document."):
         api_key = getattr(agent.settings, "gemini_api_key", None)
         if not api_key:
             return "Document analysis error: GEMINI_API_KEY is not configured in settings."
@@ -831,9 +830,10 @@ def register_tools(agent):
 
             file_id = file_id.strip()
 
-            # 1. Determine MIME type
-            mime_type = "application/pdf"
+            # 1. Determine MIME type accurately
+            mime_type = "text/plain" # Default to text/plain instead of pdf for safety with txt/code files
             if file_name:
+                file_name = file_name.lower()
                 guessed, _ = mimetypes.guess_type(file_name)
                 if guessed:
                     mime_type = guessed
@@ -843,6 +843,8 @@ def register_tools(agent):
                     mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 elif file_name.endswith(".csv"):
                     mime_type = "text/csv"
+                elif file_name.endswith(".pdf"):
+                    mime_type = "application/pdf"
 
             # 2. Download from Telegram
             tg_file = await agent.bot.get_file(file_id)
@@ -947,7 +949,7 @@ def register_tools(agent):
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Message text above the buttons (Valid Telegram HTML format)."
+                    "description": "Message text above the buttons (Telegram Rich Markdown). Do not use HTML tags unless required by Telegram Rich Markdown."
                 },
                 "buttons": {
                     "type": "array",
@@ -989,11 +991,13 @@ def register_tools(agent):
                 keyboard.append(kb_row)
 
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await agent.bot.send_message(
-                chat_id=agent.chat_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="HTML"
+            await agent.bot.do_api_request(
+                "sendRichMessage",
+                api_kwargs={
+                    "chat_id": agent.chat_id,
+                    "rich_message": {"markdown": text},
+                    "reply_markup": reply_markup.to_dict(),
+                },
             )
             return "Success: Inline keyboard message delivered to chat."
         except Exception as exc:

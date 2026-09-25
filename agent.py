@@ -11,7 +11,6 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 import httpx
 from groq import Groq, RateLimitError
-from telegram.constants import ParseMode
 
 from config import Settings
 from database.repositories import ConversationRepository, NoteRepository, ReminderRepository, UserRepository

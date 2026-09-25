@@ -9,7 +9,12 @@ from telegram import Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
-from handlers.helpers import is_owner, send_response_safely, should_sakura_reply
+from handlers.helpers import (
+    is_owner,
+    rich_markdown_to_html,
+    send_response_safely,
+    should_sakura_reply,
+)
 
 # =============================================================================
 # CONFIG
@@ -268,7 +273,7 @@ async def send_rich_final_response(
     answer: str,
 ):
     """
-    Persist the final answer with Telegram Rich Messages in private chats.
+    Persist the final answer with Telegram Rich Messages in any supported chat.
 
     The thinking draft itself is ephemeral, so Telegram expects the completed
     response to be sent with sendRichMessage.
@@ -276,10 +281,8 @@ async def send_rich_final_response(
     chat = update.effective_chat
     source_message = update.effective_message
 
-    if chat.type != ChatType.PRIVATE:
-        raise TelegramError(
-            "Rich final messages are only used in private chats."
-        )
+    if not chat:
+        raise TelegramError("No effective chat is available for the response.")
 
     if not answer:
         answer = "I couldn't generate a response."
@@ -315,23 +318,31 @@ async def deliver_final_response(
     chat = update.effective_chat
 
     # -------------------------------------------------------------------------
-    # Native Rich Message path
+    # Canonical Rich Message path (private chats, groups, supergroups, and channels
+    # where the bot is allowed to post). Telegram Rich Messages support advanced
+    # Markdown including headings, lists, tables, quotes, and fenced code.
     # -------------------------------------------------------------------------
-    if chat.type == ChatType.PRIVATE and thinking_message is None:
-        try:
-            await send_rich_final_response(
-                update=update,
-                context=context,
-                answer=answer,
-            )
-            return
+    try:
+        await send_rich_final_response(
+            update=update,
+            context=context,
+            answer=answer,
+        )
 
-        except TelegramError:
-            pass
+        # Legacy thinking placeholders are only visual scaffolding. Once the
+        # durable Rich Message is sent, remove the placeholder instead of
+        # leaving a stale "Thinking..." message in the chat.
+        if thinking_message is not None:
+            with contextlib.suppress(TelegramError):
+                await thinking_message.delete()
+        return
 
-    # -------------------------------------------------------------------------
-    # Existing project helper for legacy thinking messages
-    # -------------------------------------------------------------------------
+    except TelegramError:
+        # Rich Messages can fail on older/unsupported bot API paths. Fall back
+        # to a regular Telegram message, but convert Sakura's Rich Markdown to
+        # compatible HTML so formatting is not shown literally.
+        pass
+
     if thinking_message is not None:
         await send_response_safely(
             thinking_message,
@@ -340,11 +351,8 @@ async def deliver_final_response(
         )
         return
 
-    # -------------------------------------------------------------------------
-    # Native draft fallback
-    # -------------------------------------------------------------------------
-
-    chunks = split_text_safely(answer)
+    rendered = rich_markdown_to_html(answer)
+    chunks = split_text_safely(rendered)
 
     for index, chunk in enumerate(chunks):
         if index == 0:
@@ -730,7 +738,7 @@ async def voice_handler(
                 )
 
             except TelegramError:
-                chunks = split_text_safely(final_text)
+                chunks = split_text_safely(rich_markdown_to_html(final_text))
 
                 for index, chunk in enumerate(chunks):
                     if index == 0:
@@ -745,7 +753,7 @@ async def voice_handler(
                         )
 
         else:
-            remaining = final_text
+            remaining = rich_markdown_to_html(final_text)
             is_first_chunk = True
 
             while remaining:
