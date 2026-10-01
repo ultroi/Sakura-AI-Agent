@@ -13,7 +13,8 @@ commands:
   package: ""
   build:
     - pip install -r requirements.txt
-    - python -m py_compile app.py
+    - python -m compileall -q .
+    - python tests/smoke_static.py
   start: "python app.py"
 
 repository:

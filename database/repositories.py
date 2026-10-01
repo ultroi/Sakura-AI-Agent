@@ -184,6 +184,44 @@ class ReminderRepository:
         ).sort("run_at", 1)
         return [doc async for doc in cursor]
 
+    async def update(
+        self,
+        reminder_id: str,
+        telegram_id: int,
+        *,
+        text: str | None = None,
+        run_at: datetime | None = None,
+    ) -> bool:
+        """Update the text and/or scheduled time of a user's pending reminder."""
+        updates: dict[str, Any] = {}
+        if text is not None:
+            clean_text = text.strip()
+            if not clean_text:
+                return False
+            updates["text"] = clean_text
+        if run_at is not None:
+            # Store reminder times consistently as timezone-aware UTC datetimes.
+            if run_at.tzinfo is None:
+                run_at = run_at.replace(tzinfo=timezone.utc)
+            updates["run_at"] = run_at.astimezone(timezone.utc)
+
+        if not updates:
+            return False
+
+        updates["updated_at"] = datetime.now(timezone.utc)
+        try:
+            result = await self.collection.update_one(
+                {
+                    "_id": ObjectId(reminder_id),
+                    "telegram_id": telegram_id,
+                    "status": "pending",
+                },
+                {"$set": updates},
+            )
+            return result.matched_count > 0
+        except Exception:
+            return False
+
     async def delete(self, reminder_id: str, telegram_id: int) -> bool:
         try:
             result = await self.collection.delete_one(

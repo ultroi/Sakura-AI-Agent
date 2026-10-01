@@ -5,9 +5,12 @@ from email.message import EmailMessage
 import base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import quote
 from typing import Any
 
 from google.auth.transport.requests import Request
+from google_auth_httplib2 import AuthorizedHttp
+import httplib2
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -28,10 +31,22 @@ class GoogleService:
         self.settings = settings
         self._services: dict[str, Any] = {}
 
+    def _http(self):
+        # googleapiclient/httplib2 otherwise has no bounded request timeout.
+        return AuthorizedHttp(
+            self._creds(),
+            http=httplib2.Http(timeout=25),
+        )
+
     def _get_service(self, name: str, version: str):
         key = f"{name}:{version}"
         if key not in self._services:
-            self._services[key] = build(name, version, credentials=self._creds(), cache_discovery=False)
+            self._services[key] = build(
+                name,
+                version,
+                http=self._http(),
+                cache_discovery=False,
+            )
         return self._services[key]
 
     def _creds(self) -> Credentials:
@@ -61,7 +76,7 @@ class GoogleService:
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
-                    creds.refresh(Request())
+                    creds.refresh(Request(timeout=20))
                 except Exception:
                     # If refresh fails, wipe it out and start over
                     creds = None
@@ -91,7 +106,7 @@ class GoogleService:
 
     # --- GMAIL & CALENDAR (Existing) ---
     def gmail_list(self, query: str = "", max_results: int = 10) -> list[dict]:
-        service = build("gmail", "v1", credentials=self._creds(), cache_discovery=False)
+        service = self._get_service("gmail", "v1")
         response = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
         items = []
         for item in response.get("messages", []):
@@ -168,7 +183,7 @@ class GoogleService:
         return base64.urlsafe_b64decode(padded_data)
 
     def gmail_send(self, to: str, subject: str, body: str) -> dict:
-        service = build("gmail", "v1", credentials=self._creds(), cache_discovery=False)
+        service = self._get_service("gmail", "v1")
         message = EmailMessage()
         message.set_content(body)
         message["To"] = to
@@ -178,7 +193,7 @@ class GoogleService:
         return {"sent": True, "message_id": result.get("id"), "to": to, "subject": subject}
 
     def calendar_list(self, days: int = 7, max_results: int = 20) -> list[dict]:
-        service = build("calendar", "v3", credentials=self._creds(), cache_discovery=False)
+        service = self._get_service("calendar", "v3")
         now = datetime.now(timezone.utc)
         end = now + timedelta(days=days)
         events = service.events().list(
@@ -201,7 +216,7 @@ class GoogleService:
         ]
 
     def calendar_create(self, summary: str, start_iso: str, end_iso: str, description: str = "") -> dict:
-        service = build("calendar", "v3", credentials=self._creds(), cache_discovery=False)
+        service = self._get_service("calendar", "v3")
         event = {
             "summary": summary,
             "description": description,
@@ -213,7 +228,7 @@ class GoogleService:
 
     # --- NEW: GOOGLE DOCS ---
     def docs_read(self, document_id: str) -> str:
-        service = build("docs", "v1", credentials=self._creds(), cache_discovery=False)
+        service = self._get_service("docs", "v1")
         doc = service.documents().get(documentId=document_id).execute()
         text = ""
         for content in doc.get("body", {}).get("content", []):
@@ -225,18 +240,16 @@ class GoogleService:
 
     # --- NEW: GOOGLE DRIVE ---
     def drive_list(self, query: str = "", max_results: int = 10) -> list[dict]:
-        service = build("drive", "v3", credentials=self._creds(), cache_discovery=False)
+        service = self._get_service("drive", "v3")
         results = service.files().list(
             q=query, pageSize=max_results, fields="files(id, name, mimeType, webViewLink)"
         ).execute()
         return results.get("files", [])
 
-    # --- NEW: MAPS STATIC URL GENERATOR ---
+    # Google Maps API has been removed from the free-only build.
     def get_static_map_url(self, center: str, zoom: int = 14, size: str = "600x300") -> str:
-        # Uses Google Maps Static API endpoint with your project API key
-        api_key = self.settings.google_maps_api_key if hasattr(self.settings, "google_maps_api_key") else self.settings.groq_api_key # fallback or use separate key
-        # Maps Static API URL format:
-        return f"https://maps.googleapis.com/maps/api/staticmap?center={center}&zoom={zoom}&size={size}&maptype=roadmap&markers=color:red%7C{center}&key={self.settings.tavily_api_key}" # Note: Ensure you use your Google Maps API key in production!
+        safe = quote(center)
+        return f"https://www.openstreetmap.org/search?query={safe}"
 
     def authorize(self) -> str:
         self._creds()

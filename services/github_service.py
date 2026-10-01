@@ -10,7 +10,7 @@ class GitHubService:
     def _client(self) -> Github:
         if not self.token:
             raise RuntimeError("GITHUB_TOKEN is not configured.")
-        return Github(self.token)
+        return Github(self.token, timeout=20)
 
     def list_repos(self, limit: int = 20) -> list[dict]:
         user = self._client().get_user()

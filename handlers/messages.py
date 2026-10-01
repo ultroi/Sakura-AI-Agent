@@ -25,7 +25,7 @@ from handlers.helpers import (
 MAX_NORMAL_MESSAGE_LENGTH = 4000
 MAX_RICH_MESSAGE_LENGTH = 32768
 
-THINKING_INTERVAL = 1.2
+THINKING_INTERVAL = 4.0
 
 
 # =============================================================================
@@ -391,110 +391,48 @@ async def text_handler(
     agent = context.application.bot_data["agent"]
     chat = update.effective_chat
 
-    agent.current_message = update.effective_message
-
     user_text = (
         update.message.text
         or update.message.caption
         or ""
     )
     reply_info = ""
-
     if update.message.reply_to_message:
         replied_msg = update.message.reply_to_message
-
-        replied_text = (
-            replied_msg.text
-            or replied_msg.caption
-            or ""
-        )
-
+        replied_text = replied_msg.text or replied_msg.caption or ""
         sender_name = (
             replied_msg.from_user.first_name
             if replied_msg.from_user
             else "Someone"
         )
-
-        if replied_msg.photo:
-            rep_file_id = replied_msg.photo[-1].file_id
-
+        media_kind = (
+            "PHOTO" if replied_msg.photo
+            else "DOCUMENT" if replied_msg.document
+            else "VIDEO" if replied_msg.video
+            else "VOICE" if replied_msg.voice
+            else ""
+        )
+        if media_kind:
             reply_info = (
-                f"[Context: Senpai is replying to a PHOTO sent by "
-                f"{sender_name} (file_id: {rep_file_id}) with text: "
-                f"'{replied_text}']\n"
+                f"[Context: Senpai is replying to {sender_name}'s {media_kind}. "
+                "Media can be inspected by the appropriate tool.]\n"
             )
-
-        elif replied_msg.document:
-            rep_file_id = replied_msg.document.file_id
-            rep_name = (
-                replied_msg.document.file_name
-                or "document.pdf"
-            )
-
-            reply_info = (
-                f"[Context: Senpai is replying to a DOCUMENT sent by "
-                f"{sender_name} (file_id: {rep_file_id} "
-                f"file_name: {rep_name}) with text: "
-                f"'{replied_text}']\n"
-            )
-
-        elif replied_msg.video:
-            rep_file_id = replied_msg.video.file_id
-
-            reply_info = (
-                f"[Context: Senpai is replying to a VIDEO sent by "
-                f"{sender_name} (file_id: {rep_file_id}) with text: "
-                f"'{replied_text}']\n"
-            )
-
-        elif replied_msg.voice:
-            rep_file_id = replied_msg.voice.file_id
-
-            reply_info = (
-                f"[Context: Senpai is replying to a VOICE NOTE sent by "
-                f"{sender_name} (file_id: {rep_file_id})]\n"
-            )
-
         elif replied_text:
             reply_info = (
-                f"[Context: Senpai is replying to {sender_name}'s "
-                f"message: '{replied_text}']\n"
+                f"[Context: Senpai is replying to {sender_name}'s message: "
+                f"'{replied_text}']\n"
             )
 
     media_info = ""
-
     if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-
-        media_info = (
-            f"[System: Senpai sent a PHOTO. file_id: {file_id}]\n"
-        )
-
+        media_info = "[Context: Senpai sent a PHOTO.]\n"
     elif update.message.video:
-        file_id = update.message.video.file_id
-
-        media_info = (
-            f"[System: Senpai sent a VIDEO. file_id: {file_id}]\n"
-        )
-
+        media_info = "[Context: Senpai sent a VIDEO.]\n"
     elif update.message.document:
-        file_id = update.message.document.file_id
-        file_name = (
-            update.message.document.file_name
-            or "document.pdf"
-        )
-
-        media_info = (
-            f"[System: Senpai sent a DOCUMENT. "
-            f"file_id: {file_id} file_name: {file_name}]\n"
-        )
-
+        file_name = update.message.document.file_name or "document"
+        media_info = f"[Context: Senpai sent a DOCUMENT named '{file_name}']\n"
     elif update.message.voice:
-        file_id = update.message.voice.file_id
-
-        media_info = (
-            f"[System: Senpai sent a VOICE NOTE. file_id: {file_id}]\n"
-        )
+        media_info = "[Context: Senpai sent a VOICE NOTE.]\n"
 
     # -------------------------------------------------------------------------
     # Combine reply context, media info and user text
@@ -527,12 +465,12 @@ async def text_handler(
             telegram_id=update.effective_user.id,
             chat_id=chat.id,
             user_text=final_prompt,
+            message=update.effective_message,
         )
 
-    except Exception as exc:
-        answer = (
-            f"I ran into an internal issue: {exc}"
-        )
+    except Exception:
+        agent.log.exception("Text handler failed")
+        answer = "🌸 I hit a temporary internal error. Please try that again."
 
     finally:
         await stop_thinking(animation_task)
@@ -572,14 +510,6 @@ async def voice_handler(
         return
 
     agent = context.application.bot_data["agent"]
-
-    agent.telegram_id = update.effective_user.id
-    agent.chat_id = update.effective_chat.id
-
-    # -------------------------------------------------------------------------
-    # Cache current message for voice-related metadata
-    # -------------------------------------------------------------------------
-    agent.current_message = update.effective_message
 
     chat = update.effective_chat
 
@@ -622,8 +552,7 @@ async def voice_handler(
         # ---------------------------------------------------------------------
         # Transcribe using Groq Whisper
         # ---------------------------------------------------------------------
-        transcription = await asyncio.to_thread(
-            agent.groq.audio.transcriptions.create,
+        transcription = await agent.groq.audio.transcriptions.create(
             file=("voice.ogg", audio_bytes),
             model="whisper-large-v3-turbo",
             response_format="json",
@@ -663,18 +592,9 @@ async def voice_handler(
         await stop_thinking(animation_task)
 
         answer_stages = (
-            "Thinking",
-            "Thinking.",
-            "Thinking..",
-            "Thinking...",
-            "Thinking..",
-            "Thinking.",
-            "Thinking..",
-            "Thinking...",
-            "Thinking..",
-            "Thinking.",
-            "Thinking",
-            
+            "Thinking…",
+            "Still working…",
+            "Almost there…",
         )
 
         # ---------------------------------------------------------------------
@@ -717,13 +637,13 @@ async def voice_handler(
             update.effective_user.id,
             update.effective_chat.id,
             text,
+            message=update.effective_message,
         )
 
-        # Safely include transcription in the final response.
-        escaped_transcription = html.escape(text)
-
+        # Keep the canonical response contract Markdown-only. Do not inject raw HTML
+        # from a transcription into a message that will be parsed as Markdown.
         final_text = (
-            f"🎙️ <i>{escaped_transcription}</i>\n\n"
+            f"🎙️ Transcription: {text}\n\n"
             f"{answer}"
         )
         await stop_thinking(animation_task)
@@ -787,14 +707,11 @@ async def voice_handler(
 
                 remaining = remaining[len(chunk):].lstrip()
 
-    except Exception as exc:
+    except Exception:
+        agent.log.exception("Voice handler failed")
         await stop_thinking(animation_task)
 
-        error_text = (
-            "Voice processing error: "
-            f"<code>{html.escape(type(exc).__name__)}: "
-            f"{html.escape(str(exc))}</code>"
-        )
+        error_text = "🌸 I couldn't process that voice message right now."
 
         if thinking_msg is not None:
             await safe_edit(

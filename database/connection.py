@@ -20,18 +20,25 @@ class MongoDatabase:
 
         self.client = AsyncMongoClient(
             settings.mongodb_uri,
-            connectTimeoutMS=20_000,
-            serverSelectionTimeoutMS=15_000,
+            connectTimeoutMS=6_000,
+            serverSelectionTimeoutMS=8_000,
+            socketTimeoutMS=20_000,
             retryWrites=True,
             retryReads=True,
+            maxPoolSize=20,
+            minPoolSize=1,
+            maxIdleTimeMS=60_000,
         )
         self.db = self.client[settings.mongodb_db]
 
     async def connect(self) -> None:
         """Establishes connection and initializes the database."""
         try:
-            # Force server selection and verify that the deployment is usable.
-            await self.client.admin.command({"ping": 1})
+            # Force server selection once, with a hard application-level timeout.
+            await asyncio.wait_for(
+                self.client.admin.command({"ping": 1}),
+                timeout=10,
+            )
             
             logger.info(
                 "MongoDB connected successfully | database=%s",
@@ -56,18 +63,20 @@ class MongoDatabase:
             raise
 
     async def _setup_indexes(self) -> None:
-        """Runs all index creations concurrently."""
-        index_tasks = [
-            self.db.users.create_index("telegram_id", unique=True),
-            self.db.messages.create_index([("telegram_id", 1), ("created_at", -1)]),
-            self.db.notes.create_index([("telegram_id", 1), ("created_at", -1)]),
-            self.db.reminders.create_index([("telegram_id", 1), ("run_at", 1)]),
-            self.db.reminders.create_index("status")
+        """Create indexes sequentially to avoid startup connection bursts on small tiers."""
+        index_specs = [
+            (self.db.users, "telegram_id", {"unique": True}),
+            (self.db.messages, [("telegram_id", 1), ("created_at", -1)], {}),
+            (self.db.notes, [("telegram_id", 1), ("created_at", -1)], {}),
+            (self.db.reminders, [("telegram_id", 1), ("run_at", 1)], {}),
+            (self.db.reminders, "status", {}),
         ]
-        
-        # Execute all index creations at the same time
-        await asyncio.gather(*index_tasks)
-        logger.info("MongoDB indexes verified successfully (concurrently)")
+        for collection, keys, options in index_specs:
+            await asyncio.wait_for(
+                collection.create_index(keys, **options),
+                timeout=8,
+            )
+        logger.info("MongoDB indexes verified successfully")
 
     async def close(self) -> None:
         """Closes the database connection."""

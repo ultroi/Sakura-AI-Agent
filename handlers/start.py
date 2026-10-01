@@ -43,6 +43,9 @@ async def connect_google_command(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("🌸 This is a private assistant.")
             return
     agent = context.application.bot_data["agent"]
-    await update.message.reply_text("Starting Google authorization on the machine running Sakura. Complete the browser flow, then come back here.")
-    result = await agent.registry.execute("connect_google", {})
+    await update.message.reply_text(
+        "Starting Google authorization on the machine running Sakura. "
+        "Complete the browser flow, then come back here."
+    )
+    result = await agent.connect_google()
     await update.message.reply_text(result)

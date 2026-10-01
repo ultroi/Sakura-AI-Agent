@@ -6,11 +6,18 @@ import json
 import math
 import operator as op
 import re
+import socket
+import ipaddress
 from datetime import datetime, timezone
 from urllib.parse import quote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+
+try:
+    from google.genai import types as genai_types
+except ImportError:
+    genai_types = None
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +69,9 @@ def _safe_eval(node):
 
 
 def calculate(expression: str) -> str:
+    expression = (expression or "").strip()
+    if not expression or len(expression) > 500:
+        raise ValueError("Expression must be 1-500 characters long.")
     tree = ast.parse(expression, mode="eval")
     result = _safe_eval(tree)
     return str(result)
@@ -70,24 +80,68 @@ def calculate(expression: str) -> str:
 # Network error handling (Using shared agent.http_client for efficiency)
 # ---------------------------------------------------------------------------
 async def _http_get_json(agent, url: str, params: dict | None = None, headers: dict | None = None):
-    try:
-        response = await agent.http_client.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except httpx.TimeoutException:
-        raise Exception("The API request timed out. The service might be slow.")
-    except httpx.HTTPStatusError as exc:
-        raise Exception(f"API returned an error code: {exc.response.status_code}")
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = await agent.http_client.get(url, params=params, headers=headers)
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
+            response.raise_for_status()
+            return response.json()
+        except httpx.TimeoutException as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            break
+        except httpx.HTTPStatusError as exc:
+            raise Exception(f"API returned an error code: {exc.response.status_code}") from exc
+    raise Exception("The API request timed out or the upstream service is unavailable.") from last_error
+
 
 async def _http_post_json(agent, url: str, payload: dict, headers: dict | None = None):
+    # Do not blindly retry POST requests: some POSTs may be side-effecting.
     try:
         response = await agent.http_client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         return response.json()
-    except httpx.TimeoutException:
-        raise Exception("The API request timed out.")
+    except httpx.TimeoutException as exc:
+        raise Exception("The API request timed out.") from exc
     except httpx.HTTPStatusError as exc:
-        raise Exception(f"API returned an error code: {exc.response.status_code}")
+        raise Exception(f"API returned an error code: {exc.response.status_code}") from exc
+
+
+async def _assert_public_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only HTTP/HTTPS URLs with a hostname are supported.")
+    host = parsed.hostname.lower()
+    if host in {"localhost", "localhost.localdomain"}:
+        raise ValueError("Localhost URLs are blocked.")
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo,
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise ValueError("The hostname could not be resolved.") from exc
+
+    for item in infos:
+        address = item[4][0]
+        ip = ipaddress.ip_address(address)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError("Private or local network targets are blocked.")
 
 
 def _clean_text(html: str, max_chars: int = 15000) -> str:
@@ -96,6 +150,39 @@ def _clean_text(html: str, max_chars: int = 15000) -> str:
         tag.decompose()
     text = soup.get_text(" ", strip=True)
     return " ".join(text.split())[:max_chars]
+
+
+
+def _resolve_media_message(agent):
+    msg = agent.current_message
+    if msg is None:
+        raise ValueError("No current Telegram message is available.")
+
+    reply = getattr(msg, "reply_to_message", None)
+    if reply is not None:
+        if getattr(reply, "photo", None) or getattr(reply, "document", None):
+            return reply
+    return msg
+
+
+def _media_descriptor(message):
+    if getattr(message, "photo", None):
+        photo = message.photo[-1]
+        return {
+            "kind": "photo",
+            "file_id": photo.file_id,
+            "file_name": "photo.jpg",
+            "mime_type": "image/jpeg",
+        }
+    if getattr(message, "document", None):
+        doc = message.document
+        return {
+            "kind": "document",
+            "file_id": doc.file_id,
+            "file_name": doc.file_name or "document.bin",
+            "mime_type": doc.mime_type or "application/octet-stream",
+        }
+    raise ValueError("The current or replied-to message does not contain a supported media file.")
 
 
 def register_tools(agent):
@@ -122,8 +209,9 @@ def register_tools(agent):
 
     @r.register(
         "set_reminder",
-        "Create a Telegram reminder (a push notification ping). USE THIS FOR: 'Remind me to...', alarms, or quick personal pings. DO NOT use this for events/meetings. run_at must be an ISO-8601 timestamp in the configured local timezone.",
+        "Create a fixed-time Telegram reminder. For requests like 'watch this anime and tell me when a new season is announced' or 'tell me when this product is back in stock', use create_watch instead of set_reminder.",
         {"type": "object", "properties": {"text": {"type": "string"}, "run_at": {"type": "string", "description": "ISO-8601 datetime"}}, "required": ["text", "run_at"]},
+        side_effect=True,
     )
     async def _set_reminder(text: str, run_at: str):
         from dateutil.parser import isoparse
@@ -137,7 +225,9 @@ def register_tools(agent):
             
             reminder_id = await agent.reminders.create(agent.telegram_id, agent.chat_id, text, when.astimezone(timezone.utc))
             if hasattr(agent, "schedule_reminder"):
-                agent.schedule_reminder(reminder_id, agent.chat_id, text, when)
+                scheduled = agent.schedule_reminder(reminder_id, agent.chat_id, text, when)
+                if hasattr(scheduled, "__await__"):
+                    await scheduled
             return f"Success! Telegram reminder created for {when.strftime('%d %b %Y at %I:%M %p %Z')}."
         except Exception as exc:
             return f"Reminder error: Could not parse time. Ensure ISO-8601 format. Details: {exc}"
@@ -145,23 +235,33 @@ def register_tools(agent):
 
     @r.register(
         "web_search",
-        "Search the live web using Tavily. USE THIS for current news, facts, or things you do not confidently know.",
-        {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 8}}, "required": ["query"]},
+        "Search the public web using DuckDuckGo's free HTML endpoint. Use this for current facts, recent news, or uncertain information.",
+        {"type": "object", "properties": {"query": {"type": "string", "minLength": 2, "maxLength": 300}, "max_results": {"type": "integer", "minimum": 1, "maximum": 6}}, "required": ["query"], "additionalProperties": False},
+        timeout=25,
     )
     async def _web_search(query: str, max_results: int = 5):
-        key = agent.settings.tavily_api_key
-        if not key:
-            return "Web search is unavailable because TAVILY_API_KEY is not configured."
         try:
-            data = await _http_post_json(
-                agent,
-                "https://api.tavily.com/search",
-                {"api_key": key, "query": query, "search_depth": "basic", "max_results": max(1, min(max_results, 8)), "include_answer": True},
+            response = await agent.http_client.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query, "kl": "us-en"},
+                headers={"User-Agent": "SakuraAI/1.0"},
             )
-            results = [{"title": x.get("title"), "url": x.get("url"), "content": x.get("content", "")} for x in data.get("results", [])]
-            return json.dumps({"answer": data.get("answer"), "results": results}, ensure_ascii=False)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "lxml")
+            results = []
+            for item in soup.select(".result")[:max(1, min(max_results, 6))]:
+                anchor = item.select_one(".result__a")
+                snippet = item.select_one(".result__snippet")
+                if not anchor:
+                    continue
+                results.append({
+                    "title": anchor.get_text(" ", strip=True),
+                    "url": anchor.get("href"),
+                    "content": snippet.get_text(" ", strip=True) if snippet else "",
+                })
+            return json.dumps({"query": query, "results": results}, ensure_ascii=False)
         except Exception as exc:
-            return f"Web search error: {exc}. Tell the user the search engine is temporarily down."
+            return f"Web search error: {exc}"
 
     @r.register(
         "get_weather",
@@ -198,13 +298,7 @@ def register_tools(agent):
     )
     async def _translate(text: str, target_language: str):
         try:
-            response = await asyncio.to_thread(
-                agent.groq.chat.completions.create,
-                model="openai/gpt-oss-20b",
-                messages=[{"role": "system", "content": f"Translate the user's text into {target_language}. Return only the translation."}, {"role": "user", "content": text}],
-                temperature=0.1,
-            )
-            return response.choices[0].message.content or ""
+            return await agent.translate_text(text, target_language)
         except Exception as exc:
             return f"Translation error: {exc}"
 
@@ -215,21 +309,34 @@ def register_tools(agent):
     )
     async def _fetch_url(url: str):
         try:
-            parsed = urlparse(url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                return "URL error: only public HTTP/HTTPS URLs are supported."
-            
+            await _assert_public_url(url)
             response = await agent.http_client.get(
-                url, 
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                url,
+                follow_redirects=False,
+                headers={"User-Agent": "SakuraAI/1.0"},
             )
+            # Do not automatically follow redirects: validate the redirect target
+            # first to prevent localhost/private-network SSRF through a public URL.
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("location")
+                if not location:
+                    return "URL error: the website returned a redirect without a target."
+                from urllib.parse import urljoin
+                target = urljoin(url, location)
+                await _assert_public_url(target)
+                response = await agent.http_client.get(
+                    target,
+                    follow_redirects=False,
+                    headers={"User-Agent": "SakuraAI/1.0"},
+                )
+
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
             if "text/html" in content_type:
                 text = _clean_text(response.text)
             else:
                 text = response.text[:15000]
-            return json.dumps({"url": url, "content_type": content_type, "text": text}, ensure_ascii=False)
+            return json.dumps({"url": str(response.url), "content_type": content_type, "text": text}, ensure_ascii=False)
         except Exception as exc:
             return f"URL fetch error: {exc}. Inform the user that the website couldn't be reached."
 
@@ -269,6 +376,7 @@ def register_tools(agent):
             },
             "required": ["message_id", "attachment_id", "filename"],
         },
+        side_effect=True,
     )
     async def _gmail_send_attachment(message_id: str, attachment_id: str, filename: str):
         if not hasattr(agent, "bot"):
@@ -300,6 +408,7 @@ def register_tools(agent):
             }, 
             "required": ["to", "subject", "body"]
         },
+        side_effect=True,
     )
     async def _gmail_send(to: str, subject: str, body: str):
         try:
@@ -324,6 +433,7 @@ def register_tools(agent):
         "calendar_create",
         "Create a Google Calendar event. USE THIS FOR: 'Schedule a meeting', 'Block my calendar', or events. DO NOT use this for personal Telegram reminders. Requires ISO-8601 timestamps.",
         {"type": "object", "properties": {"summary": {"type": "string"}, "start_iso": {"type": "string"}, "end_iso": {"type": "string"}, "description": {"type": "string"}}, "required": ["summary", "start_iso", "end_iso"]},
+        side_effect=True,
     )
     async def _calendar_create(summary: str, start_iso: str, end_iso: str, description: str = ""):
         try:
@@ -360,6 +470,7 @@ def register_tools(agent):
         "github_create_issue",
         "Create a GitHub issue in a repository.",
         {"type": "object", "properties": {"owner": {"type": "string"}, "repo": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["owner", "repo", "title"]},
+        side_effect=True,
     )
     async def _github_create_issue(owner: str, repo: str, title: str, body: str = ""):
         try:
@@ -372,6 +483,7 @@ def register_tools(agent):
         "connect_google",
         "Start Google OAuth setup for Gmail and Calendar. Use ONLY when the user explicitly asks to connect/authorize Google.",
         {"type": "object", "properties": {}, "additionalProperties": False},
+        side_effect=True,
     )
     async def _connect_google():
         try:
@@ -404,6 +516,7 @@ def register_tools(agent):
             },
             "required": [],
         },
+        side_effect=True,
     )
     async def _update_user_profile(
         name: str = None,
@@ -474,138 +587,171 @@ def register_tools(agent):
 
     @r.register(
         "get_map_image",
-        "Generate a static satellite or roadmap image URL for a given location or address with an optional pinpoint marker.",
+        "Open a free OpenStreetMap map view for a location. This does not call a paid maps API.",
         {
             "type": "object",
             "properties": {
-                "location": {"type": "string", "description": "Address or location (e.g. 'Bhiwadi, Rajasthan')"},
-                "zoom": {"type": "integer", "description": "Zoom level between 1 (world) and 20 (building). Default 14.", "default": 14},
-                "maptype": {"type": "string", "enum": ["roadmap", "satellite", "terrain", "hybrid"], "default": "roadmap"}
+                "location": {"type": "string", "minLength": 2, "maxLength": 250},
+                "zoom": {"type": "integer", "minimum": 1, "maximum": 19},
             },
             "required": ["location"],
+            "additionalProperties": False,
         },
     )
-    async def _get_map_image(location: str, zoom: int = 14, maptype: str = "roadmap"):
-        api_key = getattr(agent.settings, "google_maps_api_key", None)
-        if not api_key:
-            return "Maps error: GOOGLE_MAPS_API_KEY is not configured in settings."
+    async def _get_map_image(location: str, zoom: int = 14):
         try:
-            safe_loc = quote(location)
-            map_url = (
-                f"https://maps.googleapis.com/maps/api/staticmap?"
-                f"center={safe_loc}&zoom={zoom}&size=600x350&scale=2&maptype={maptype}"
-                f"&markers=color:red%7Clabel:S%7C{safe_loc}&key={api_key}"
+            geo = await _http_get_json(
+                agent,
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": location,
+                    "format": "jsonv2",
+                    "limit": 1,
+                    "addressdetails": 1,
+                },
+                headers={"User-Agent": "SakuraAI/1.0"},
             )
-            return json.dumps({
-                "location": location,
-                "map_image_url": map_url,
-                "note": "Include this URL as an HTML link or photo so the user can see the map view."
-            }, ensure_ascii=False)
+            if not geo:
+                return json.dumps({"ok": False, "error": f"Location not found: {location}"}, ensure_ascii=False)
+            lat = geo[0]["lat"]
+            lon = geo[0]["lon"]
+            return json.dumps(
+                {
+                    "location": location,
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "map_url": f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map={zoom}/{lat}/{lon}",
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:
-            return f"Map image generation error: {exc}"
+            return f"Map lookup error: {exc}"
 
     @r.register(
         "get_directions",
-        "Calculate transit routes, travel duration, distance, and step-by-step navigation directions between two locations.",
+        "Get a driving route between two places using free OpenStreetMap geocoding and OSRM routing.",
         {
             "type": "object",
             "properties": {
-                "origin": {"type": "string", "description": "Starting address or landmark"},
-                "destination": {"type": "string", "description": "Ending address or landmark"},
-                "mode": {"type": "string", "enum": ["driving", "walking", "bicycling", "transit"], "default": "driving"}
+                "origin": {"type": "string", "minLength": 2, "maxLength": 250},
+                "destination": {"type": "string", "minLength": 2, "maxLength": 250},
             },
             "required": ["origin", "destination"],
+            "additionalProperties": False,
         },
+        timeout=30,
     )
-    async def _get_directions(origin: str, destination: str, mode: str = "driving"):
-        api_key = getattr(agent.settings, "google_maps_api_key", None)
-        if not api_key:
-            return "Maps error: GOOGLE_MAPS_API_KEY is not configured in settings."
+    async def _get_directions(origin: str, destination: str):
         try:
-            url = "https://maps.googleapis.com/maps/api/directions/json"
-            params = {
-                "origin": origin,
-                "destination": destination,
-                "mode": mode,
-                "key": api_key,
-            }
-            data = await _http_get_json(agent, url, params=params)
-            if data.get("status") != "OK":
-                return f"Directions lookup failed: {data.get('status')} - {data.get('error_message', 'No route found.')}"
+            async def geocode(place: str):
+                data = await _http_get_json(
+                    agent,
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": place, "format": "jsonv2", "limit": 1},
+                    headers={"User-Agent": "SakuraAI/1.0"},
+                )
+                if not data:
+                    raise ValueError(f"Location not found: {place}")
+                return float(data[0]["lat"]), float(data[0]["lon"]), data[0].get("display_name", place)
 
-            route = data["routes"][0]["legs"][0]
-            steps = [
-                re.sub(r"<[^>]+>", "", step.get("html_instructions", ""))
-                for step in route.get("steps", [])[:8]
-            ]
+            o_lat, o_lon, o_name = await geocode(origin)
+            d_lat, d_lon, d_name = await geocode(destination)
 
-            result = {
-                "start_address": route.get("start_address"),
-                "end_address": route.get("end_address"),
-                "distance": route.get("distance", {}).get("text"),
-                "duration": route.get("duration", {}).get("text"),
-                "key_steps": steps,
-            }
-            return json.dumps(result, ensure_ascii=False)
+            route = await _http_get_json(
+                agent,
+                f"https://router.project-osrm.org/route/v1/driving/{o_lon},{o_lat};{d_lon},{d_lat}",
+                params={"overview": "false", "steps": "true"},
+            )
+            routes = route.get("routes", [])
+            if not routes:
+                return "Directions error: no driving route found."
+
+            best = routes[0]
+            steps = []
+            for leg in best.get("legs", []):
+                for step in leg.get("steps", [])[:8]:
+                    maneuver = step.get("maneuver", {})
+                    instruction = maneuver.get("type", "continue").replace("_", " ")
+                    name = step.get("name")
+                    text = instruction if not name else f"{instruction} onto {name}"
+                    steps.append(text)
+
+            return json.dumps(
+                {
+                    "origin": o_name,
+                    "destination": d_name,
+                    "distance_km": round(best.get("distance", 0) / 1000, 2),
+                    "duration_minutes": round(best.get("duration", 0) / 60, 1),
+                    "key_steps": steps,
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:
             return f"Directions error: {exc}"
 
     @r.register(
         "search_places",
-        "Search for nearby places, landmarks, restaurants, hospitals, or amenities around a location.",
+        "Find nearby or matching places with free OpenStreetMap Nominatim search. Results do not include commercial ratings.",
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search target (e.g. 'coffee shops near Sohna' or 'hospitals in Bhiwadi')"},
-                "max_results": {"type": "integer", "default": 5}
+                "query": {"type": "string", "minLength": 2, "maxLength": 250},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 8},
             },
             "required": ["query"],
+            "additionalProperties": False,
         },
+        timeout=25,
     )
     async def _search_places(query: str, max_results: int = 5):
-        api_key = getattr(agent.settings, "google_maps_api_key", None)
-        if not api_key:
-            return "Maps error: GOOGLE_MAPS_API_KEY is not configured in settings."
         try:
-            url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-            params = {
-                "query": query,
-                "key": api_key,
-            }
-            data = await _http_get_json(agent, url, params=params)
-            if data.get("status") not in ("OK", "ZERO_RESULTS"):
-                return f"Place search failed: {data.get('status')} - {data.get('error_message', '')}"
-
-            places = []
-            for item in data.get("results", [])[:max(1, min(max_results, 10))]:
-                places.append({
-                    "name": item.get("name"),
-                    "address": item.get("formatted_address"),
-                    "rating": item.get("rating", "N/A"),
-                    "user_ratings_total": item.get("user_ratings_total", 0),
-                    "open_now": item.get("opening_hours", {}).get("open_now", "Unknown"),
-                })
-            return json.dumps(places, ensure_ascii=False)
+            data = await _http_get_json(
+                agent,
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": query,
+                    "format": "jsonv2",
+                    "limit": max(1, min(max_results, 8)),
+                    "addressdetails": 1,
+                },
+                headers={"User-Agent": "SakuraAI/1.0"},
+            )
+            results = [
+                {
+                    "name": item.get("name") or item.get("display_name", "").split(",")[0],
+                    "address": item.get("display_name"),
+                    "latitude": float(item["lat"]),
+                    "longitude": float(item["lon"]),
+                    "osm_type": item.get("osm_type"),
+                    "osm_id": item.get("osm_id"),
+                }
+                for item in data
+            ]
+            return json.dumps(results, ensure_ascii=False)
         except Exception as exc:
-            return f"Places error: {exc}"
+            return f"Places search error: {exc}"
 
     @r.register(
         "get_map_link",
-        "Generate a direct, clickable official Google Maps link for directions or place inspection on a mobile/desktop browser.",
+        "Generate a free OpenStreetMap search link for a place or address.",
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Address, coordinates, or search query"}
+                "query": {"type": "string", "minLength": 2, "maxLength": 250},
             },
             "required": ["query"],
+            "additionalProperties": False,
         },
     )
     async def _get_map_link(query: str):
         safe_q = quote(query)
-        return json.dumps({
-            "query": query,
-            "url": f"https://www.google.com/maps/search/?api=1&query={safe_q}"
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "query": query,
+                "url": f"https://www.openstreetmap.org/search?query={safe_q}",
+            },
+            ensure_ascii=False,
+        )
 
     # ---------------------------------------------------------------------------
     # CRUD Memory Notes
@@ -620,6 +766,7 @@ def register_tools(agent):
             "distinct title for something genuinely new."
         ),
         {"type": "object", "properties": {"title": {"type": "string"}, "content": {"type": "string"}}, "required": ["title", "content"]},
+        side_effect=True,
     )
     async def _save_note(title: str, content: str):
         note_id, action = await agent.notes.upsert_by_title(agent.telegram_id, title, content)
@@ -659,6 +806,7 @@ def register_tools(agent):
             }, 
             "required": ["note_id", "title", "content"]
         },
+        side_effect=True,
     )
     async def _update_note(note_id: str, title: str, content: str):
         success = await agent.notes.update(note_id, agent.telegram_id, title, content)
@@ -668,6 +816,7 @@ def register_tools(agent):
         "delete_note",
         "Delete a saved note or memory. You MUST get the note 'id' from search_notes or recent_notes first.",
         {"type": "object", "properties": {"note_id": {"type": "string"}}, "required": ["note_id"]},
+        side_effect=True,
     )
     async def _delete_note(note_id: str):
         success = await agent.notes.delete(note_id, agent.telegram_id)
@@ -701,19 +850,239 @@ def register_tools(agent):
         "delete_reminder",
         "Cancel or delete a pending reminder. You MUST get the reminder 'id' from list_reminders first.",
         {"type": "object", "properties": {"reminder_id": {"type": "string"}}, "required": ["reminder_id"]},
+        side_effect=True,
     )
     async def _delete_reminder(reminder_id: str):
         # 1. Delete from database
         success = await agent.reminders.delete(reminder_id, agent.telegram_id)
         
         if success:
-            # 2. Kill the background running process
+            # Optional in-process scheduler hook.
             if hasattr(agent, "cancel_reminder"):
-                agent.cancel_reminder(reminder_id)
-            return "Successfully canceled the reminder and stopped the background process."
+                try:
+                    result = agent.cancel_reminder(reminder_id)
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:
+                    pass
+            return "Successfully canceled the reminder."
             
         return "Failed to cancel: Invalid ID or reminder already sent."
 
+
+    @r.register(
+        "edit_reminder",
+        (
+            "Edit a pending reminder. You MUST get the reminder 'id' from list_reminders first. "
+            "Change its text, scheduled time, or both."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "string"},
+                "text": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "run_at": {
+                    "type": "string",
+                    "description": "Future ISO-8601 datetime in the configured local timezone."
+                },
+            },
+            "required": ["reminder_id"],
+            "additionalProperties": False,
+        },
+        side_effect=True,
+    )
+    async def _edit_reminder(reminder_id: str, text: str = None, run_at: str = None):
+        if text is None and run_at is None:
+            return "Please provide new reminder text, a new time, or both."
+
+        from dateutil.parser import isoparse
+
+        when = None
+        if run_at is not None:
+            try:
+                when = isoparse(run_at)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=agent.tz)
+                when = when.astimezone(agent.tz)
+            except Exception as exc:
+                return f"Reminder edit error: Could not parse time: {exc}"
+
+            if when <= agent.now():
+                return "Reminder edit error: The new time must be in the future."
+
+        try:
+            success = await agent.reminders.update(
+                reminder_id,
+                agent.telegram_id,
+                text=text,
+                run_at=when.astimezone(timezone.utc) if when is not None else None,
+            )
+            if not success:
+                return (
+                    "Failed to update: invalid ID, reminder not found, "
+                    "or reminder is no longer pending."
+                )
+
+            # Refresh an optional in-process scheduler if the host application
+            # provides scheduler hooks. Fetch the updated reminder first so a
+            # text-only edit keeps the original scheduled time.
+            if hasattr(agent, "cancel_reminder") and hasattr(agent, "schedule_reminder"):
+                try:
+                    docs = await agent.reminders.get_user_pending(agent.telegram_id)
+                    updated = next(
+                        (d for d in docs if str(d.get("_id")) == reminder_id),
+                        None,
+                    )
+                    if updated is not None:
+                        stored_run_at = updated.get("run_at")
+                        if stored_run_at is not None:
+                            if stored_run_at.tzinfo is None:
+                                stored_run_at = stored_run_at.replace(tzinfo=timezone.utc)
+                            local_run_at = stored_run_at.astimezone(agent.tz)
+
+                            cancel_result = agent.cancel_reminder(reminder_id)
+                            if hasattr(cancel_result, "__await__"):
+                                await cancel_result
+
+                            schedule_result = agent.schedule_reminder(
+                                reminder_id,
+                                agent.chat_id,
+                                updated.get("text", ""),
+                                local_run_at,
+                            )
+                            if hasattr(schedule_result, "__await__"):
+                                await schedule_result
+                except Exception:
+                    # The DB update already succeeded. Scheduler refresh is best-effort.
+                    pass
+
+            if when is not None:
+                return (
+                    "Successfully updated the reminder. New time: "
+                    f"{when.strftime('%d %b %Y at %I:%M %p %Z')}."
+                )
+            return "Successfully updated the reminder."
+        except Exception as exc:
+            return f"Reminder edit error: {type(exc).__name__}: {exc}"
+
+
+
+    # ---------------------------------------------------------------------------
+    # Persistent condition watches
+    # ---------------------------------------------------------------------------
+    @r.register(
+        "create_watch",
+        (
+            "Create a persistent background monitor. Use for requests such as: "
+            "watch an anime for an official new-season announcement, monitor a product "
+            "until it is back in stock, or watch a specific webpage for a change. "
+            "This is NOT a fixed-time reminder. It keeps checking until the condition occurs."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["anime", "product", "website"]},
+                "target": {"type": "string", "minLength": 2, "maxLength": 200},
+                "condition": {"type": "string", "minLength": 2, "maxLength": 500},
+                "query": {"type": "string", "maxLength": 500},
+                "url": {"type": "string", "maxLength": 1000},
+                "interval_minutes": {"type": "integer", "minimum": 15, "maximum": 1440, "description": "How often to check. If omitted: anime 360 min, product 60 min, website 360 min."},
+            },
+            "required": ["kind", "target", "condition"],
+            "additionalProperties": False,
+        },
+        side_effect=True,
+        timeout=20,
+    )
+    async def _create_watch(
+        kind: str,
+        target: str,
+        condition: str,
+        interval_minutes: int | None = None,
+        query: str = "",
+        url: str = "",
+    ):
+        kind = (kind or "").strip().lower()
+        target = (target or "").strip()
+        condition = (condition or "").strip()
+        query = (query or "").strip()
+        url = (url or "").strip()
+
+        if kind == "website" and not url:
+            return "Watch error: a website watch requires a URL."
+        if kind == "product" and not url and not query:
+            query = f"{target} {condition}"
+        if kind == "anime" and not query:
+            query = f"{target} {condition} official announcement"
+
+        if interval_minutes is None:
+            interval_minutes = 360 if kind in {"anime", "website"} else 60
+
+        current = await agent.watches.count_user(agent.telegram_id)
+        if current >= 20:
+            return "Watch limit reached: you can have up to 20 active watches."
+
+        watch_id = await agent.watches.create(
+            agent.telegram_id,
+            agent.chat_id,
+            kind=kind,
+            target=target,
+            condition=condition,
+            query=query,
+            url=url,
+            interval_minutes=max(15, min(int(interval_minutes), 1440)),
+        )
+        agent.ensure_watcher_worker()
+        return json.dumps(
+            {
+                "watch_id": watch_id,
+                "kind": kind,
+                "target": target,
+                "condition": condition,
+                "interval_minutes": max(15, min(int(interval_minutes), 1440)),
+                "status": "active",
+            },
+            ensure_ascii=False,
+        )
+
+    @r.register(
+        "list_watches",
+        "List the user's persistent background watches and their current status. Use before deleting a watch.",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    async def _list_watches():
+        docs = await agent.watches.list_user(agent.telegram_id)
+        if not docs:
+            return "No active or saved watches."
+        rows = []
+        for d in docs:
+            next_check = d.get("next_check_at")
+            if hasattr(next_check, "astimezone"):
+                next_check_text = next_check.astimezone(agent.tz).strftime("%d %b %Y at %I:%M %p %Z")
+            else:
+                next_check_text = "unknown"
+            rows.append(
+                {
+                    "id": str(d["_id"]),
+                    "kind": d.get("kind"),
+                    "target": d.get("target"),
+                    "condition": d.get("condition"),
+                    "interval_minutes": d.get("interval_minutes"),
+                    "enabled": bool(d.get("enabled", True)),
+                    "next_check": next_check_text,
+                }
+            )
+        return json.dumps(rows, ensure_ascii=False)
+
+    @r.register(
+        "delete_watch",
+        "Delete a persistent background watch. You MUST obtain watch_id from list_watches first.",
+        {"type": "object", "properties": {"watch_id": {"type": "string"}}, "required": ["watch_id"], "additionalProperties": False},
+        side_effect=True,
+    )
+    async def _delete_watch(watch_id: str):
+        success = await agent.watches.delete(watch_id, agent.telegram_id)
+        return "Successfully stopped the watch." if success else "Failed to stop: invalid watch ID or watch not found."
 
     @r.register(
         "send_telegram_media",
@@ -725,7 +1094,8 @@ def register_tools(agent):
                 "file_id": {"type": "string"}
             },
             "required": ["file_type", "file_id"]
-        }
+        },
+        side_effect=True,
     )
     async def _send_telegram_media(file_type: str, file_id: str):
         if not hasattr(agent, "bot"):
@@ -746,142 +1116,113 @@ def register_tools(agent):
 
     @r.register(
         "analyze_image",
-        "Use this tool to 'see' and read an image ONLY IF Senpai explicitly asks a question about its contents. DO NOT use this if Senpai just wants to save the image.",
+        "Analyze the image attached to the current Telegram message or the message being replied to. Do not invent file IDs.",
         {
             "type": "object",
             "properties": {
-                "file_id": {"type": "string"},
-                "prompt": {"type": "string", "description": "What to ask the vision model about the image (default: 'Describe this image in detail and read any text in it.')"}
+                "prompt": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 1000,
+                    "description": "What to inspect in the image."
+                }
             },
-            "required": ["file_id"]
+            "required": [],
+            "additionalProperties": False,
         },
+        timeout=90,
     )
-    async def _analyze_image(file_id: str, prompt: str = "Describe this image in detail and read any text in it."):
-        api_key = getattr(agent.settings, "gemini_api_key", None)
-        if not api_key:
-            return "Vision error: GEMINI_API_KEY is not configured in settings."
-        
+    async def _analyze_image(prompt: str = "Describe the image and read any useful text from it."):
+        if agent.gemini is None or genai_types is None:
+            return "Vision is unavailable because GEMINI_API_KEY is not configured."
+        if not hasattr(agent, "bot"):
+            return "Vision error: Telegram Bot instance is not connected."
+
         try:
-            import base64
-            if not hasattr(agent, "bot"):
-                return "Error: Telegram bot not connected."
-            
-            file_id = file_id.strip()
-            
-            # --- STEP 1: Download from Telegram ---
-            try:
-                tg_file = await agent.bot.get_file(file_id)
-                image_bytes = await tg_file.download_as_bytearray()
-                base64_image = base64.b64encode(image_bytes).decode("utf-8")
-            except Exception as e:
-                return f"Telegram File Download Error: Could not fetch image from Telegram. Details: {e}"
-            
-            # --- STEP 2: Send to Gemini ---
-            # Updated to match the latest gemini-3.8-flash model
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}}
-                    ]
-                }]
-            }
-            
-            response = await agent.http_client.post(
-                url, 
-                json=payload, 
-                headers={"Content-Type": "application/json"}
+            message = _resolve_media_message(agent)
+            meta = _media_descriptor(message)
+            if meta["kind"] != "photo":
+                mime = meta["mime_type"]
+                if not mime.startswith("image/"):
+                    return "Vision error: the current/replied file is not an image."
+
+            tg_file = await agent.bot.get_file(meta["file_id"])
+            image_bytes = bytes(await tg_file.download_as_bytearray())
+            if len(image_bytes) > 15 * 1024 * 1024:
+                return "Vision error: image is larger than 15 MB."
+
+            response = await agent.gemini.aio.models.generate_content(
+                model=getattr(agent, "MODEL_GEMINI", agent.GEMINI_MODELS[0]),
+                contents=[
+                    genai_types.Content(
+                        role="user",
+                        parts=[
+                            genai_types.Part.from_text(text=prompt),
+                            genai_types.Part.from_bytes(
+                                data=image_bytes,
+                                mime_type=meta["mime_type"],
+                            ),
+                        ],
+                    )
+                ],
             )
-            
-            if response.status_code != 200:
-                return f"Gemini API Error {response.status_code}: {response.text}"
-                
-            data = response.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-            
+            return response.text or "The vision model returned no text."
         except Exception as exc:
             return f"Vision processing error: {type(exc).__name__}: {exc}"
 
     @r.register(
         "analyze_document",
-        "Use this tool to read, parse, and analyze an uploaded document (PDF, Word doc, Excel/CSV, or text file) ONLY IF Senpai explicitly asks a question or instructs you to read its contents. DO NOT use this if Senpai just asks to save or store the document.",
+        "Read and analyze the document attached to the current Telegram message or the message being replied to. Do not invent file IDs or filenames.",
         {
             "type": "object",
             "properties": {
-                "file_id": {"type": "string", "description": "The Telegram file_id of the document."},
-                "file_name": {"type": "string", "description": "The filename with extension (e.g. report.pdf, data.xlsx)."},
-                "prompt": {"type": "string", "description": "What specific information or analysis to extract from the document."}
+                "prompt": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 1500,
+                    "description": "What to extract, explain, solve, or summarize from the document."
+                }
             },
-            # FIX: Made file_name required so mimetypes can accurately guess the file format.
-            "required": ["file_id", "file_name"]
+            "required": [],
+            "additionalProperties": False,
         },
+        timeout=120,
     )
-    async def _analyze_document(file_id: str, file_name: str, prompt: str = "Summarize and extract key information from this document."):
-        api_key = getattr(agent.settings, "gemini_api_key", None)
-        if not api_key:
-            return "Document analysis error: GEMINI_API_KEY is not configured in settings."
+    async def _analyze_document(prompt: str = "Summarize the document and extract the most important information."):
+        if agent.gemini is None or genai_types is None:
+            return "Document analysis is unavailable because GEMINI_API_KEY is not configured."
         if not hasattr(agent, "bot"):
-            return "Error: Telegram bot not connected."
+            return "Document analysis error: Telegram Bot instance is not connected."
 
         try:
-            import base64
-            import mimetypes
+            message = _resolve_media_message(agent)
+            meta = _media_descriptor(message)
+            if meta["kind"] != "document":
+                return "Document analysis error: the current/replied message is not a document."
 
-            file_id = file_id.strip()
+            tg_file = await agent.bot.get_file(meta["file_id"])
+            doc_bytes = bytes(await tg_file.download_as_bytearray())
+            if len(doc_bytes) > 15 * 1024 * 1024:
+                return "Document analysis error: document is larger than 15 MB."
 
-            # 1. Determine MIME type accurately
-            mime_type = "text/plain" # Default to text/plain instead of pdf for safety with txt/code files
-            if file_name:
-                file_name = file_name.lower()
-                guessed, _ = mimetypes.guess_type(file_name)
-                if guessed:
-                    mime_type = guessed
-                elif file_name.endswith((".xlsx", ".xls")):
-                    mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                elif file_name.endswith((".docx", ".doc")):
-                    mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                elif file_name.endswith(".csv"):
-                    mime_type = "text/csv"
-                elif file_name.endswith(".pdf"):
-                    mime_type = "application/pdf"
-
-            # 2. Download from Telegram
-            tg_file = await agent.bot.get_file(file_id)
-            doc_bytes = await tg_file.download_as_bytearray()
-            base64_doc = base64.b64encode(doc_bytes).decode("utf-8")
-
-            # 3. Request Gemini Multimodal Engine
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": prompt},
-                        {"inline_data": {"mime_type": mime_type, "data": base64_doc}}
-                    ]
-                }]
-            }
-
-            response = await agent.http_client.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=120.0
+            response = await agent.gemini.aio.models.generate_content(
+                model=getattr(agent, "MODEL_GEMINI", agent.GEMINI_MODELS[0]),
+                contents=[
+                    genai_types.Content(
+                        role="user",
+                        parts=[
+                            genai_types.Part.from_text(text=prompt),
+                            genai_types.Part.from_bytes(
+                                data=doc_bytes,
+                                mime_type=meta["mime_type"],
+                            ),
+                        ],
+                    )
+                ],
             )
-
-            if response.status_code != 200:
-                return f"Gemini Document API Error {response.status_code}: {response.text}"
-
-            data = response.json()
-            candidates = data.get("candidates", [])
-            if not candidates or "content" not in candidates[0]:
-                return "The document could not be analyzed (possibly blocked by safety filters or empty content)."
-
-            return candidates[0]["content"]["parts"][0]["text"]
-
+            return response.text or "The document model returned no text."
         except Exception as exc:
             return f"Document processing error: {type(exc).__name__}: {exc}"
-
 
     @r.register(
         "inspect_telegram_context",
@@ -969,7 +1310,8 @@ def register_tools(agent):
                 }
             },
             "required": ["text", "buttons"]
-        }
+        },
+        side_effect=True,
     )
     async def _send_inline_keyboard(text: str, buttons: list[list[dict]]):
         if not hasattr(agent, "bot"):
@@ -981,11 +1323,21 @@ def register_tools(agent):
             for row in buttons:
                 kb_row = []
                 for b in row:
+                    url = b.get("url")
+                    callback_data = b.get("callback_data")
+                    if not url and not callback_data:
+                        raise ValueError(
+                            "Every inline button needs either a URL or callback_data."
+                        )
+                    if url and callback_data:
+                        raise ValueError(
+                            "A button cannot contain both URL and callback_data."
+                        )
                     kb_row.append(
                         InlineKeyboardButton(
                             text=b["text"],
-                            url=b.get("url"),
-                            callback_data=b.get("callback_data")
+                            url=url,
+                            callback_data=callback_data,
                         )
                     )
                 keyboard.append(kb_row)
