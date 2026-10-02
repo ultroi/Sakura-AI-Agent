@@ -19,4 +19,4 @@ repository:
   auto_deploy: True
 
 env:
-  - BOT_TOKEN:YOUR_TELEGRAM_BOT_TOKEN
+  - BOT_TOKEN:BOT_TOKEN
