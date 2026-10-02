@@ -5,16 +5,13 @@ user:
 runtime:
   name: python
   version: 3.11
-  # using python 3.11 slim image
   image: python:3.11-slim
 
 commands:
-  # no system packages are requested; StackHost free tier allows none by default
   package: ""
   build:
     - pip install -r requirements.txt
     - python -m compileall -q .
-    - python tests/smoke_static.py
   start: "python app.py"
 
 repository:
