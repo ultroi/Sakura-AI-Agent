@@ -44,26 +44,57 @@ _ALLOWED_FUNCS = {
     "round": round,
 }
 _ALLOWED_NAMES = {"pi": math.pi, "e": math.e}
+_MAX_AST_NODES = 200
+_MAX_RESULT_DIGITS = 5000
+_MAX_EXPONENT = 1000
 
 
-def _safe_eval(node):
+def _int_digits(value: int) -> int:
+    if value == 0:
+        return 1
+    return int(value.bit_length() * 0.30103) + 1
+
+
+def _safe_eval(node, state=None):
+    state = state if state is not None else {"nodes": 0}
+    state["nodes"] += 1
+    if state["nodes"] > _MAX_AST_NODES:
+        raise ValueError("Expression is too complex.")
+
     if isinstance(node, ast.Expression):
-        return _safe_eval(node.body)
+        return _safe_eval(node.body, state)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-        left, right = _safe_eval(node.left), _safe_eval(node.right)
-        if isinstance(node.op, ast.Pow) and abs(right) > 1000:
-            raise ValueError("Exponent too large. Keep it under 1000.")
+        left = _safe_eval(node.left, state)
+        right = _safe_eval(node.right, state)
+        if isinstance(node.op, ast.Pow):
+            if not isinstance(right, (int, float)) or not math.isfinite(float(right)):
+                raise ValueError("Exponent must be a finite number.")
+            if abs(right) > _MAX_EXPONENT:
+                raise ValueError(f"Exponent too large. Keep it under {_MAX_EXPONENT}.")
+            if left == 0 and right < 0:
+                raise ValueError("Division by zero is not allowed.")
+            if abs(left) > 1 and right > 0:
+                if isinstance(left, int):
+                    estimated_digits = int((_int_digits(abs(left)) - 1) * right) + 1
+                else:
+                    estimated_digits = int(math.floor(math.log10(abs(left)) * right)) + 1
+                if estimated_digits > _MAX_RESULT_DIGITS:
+                    raise ValueError("Result would be too large to calculate safely.")
+            return _ALLOWED_BINOPS[type(node.op)](left, right)
         if type(node.op) in (ast.Div, ast.FloorDiv, ast.Mod) and right == 0:
             raise ValueError("Division by zero is not allowed.")
+        if type(node.op) is ast.Mult and isinstance(left, int) and isinstance(right, int):
+            if _int_digits(left) + _int_digits(right) > _MAX_RESULT_DIGITS:
+                raise ValueError("Result would be too large to calculate safely.")
         return _ALLOWED_BINOPS[type(node.op)](left, right)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
-        return _ALLOWED_UNARYOPS[type(node.op)](_safe_eval(node.operand))
+        return _ALLOWED_UNARYOPS[type(node.op)](_safe_eval(node.operand, state))
     if isinstance(node, ast.Name) and node.id in _ALLOWED_NAMES:
         return _ALLOWED_NAMES[node.id]
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ALLOWED_FUNCS:
-        args = [_safe_eval(a) for a in node.args]
+        args = [_safe_eval(a, state) for a in node.args]
         return _ALLOWED_FUNCS[node.func.id](*args)
     raise ValueError("Unsupported mathematical expression.")
 
@@ -73,8 +104,9 @@ def calculate(expression: str) -> str:
     if not expression or len(expression) > 500:
         raise ValueError("Expression must be 1-500 characters long.")
     tree = ast.parse(expression, mode="eval")
-    result = _safe_eval(tree)
+    result = _safe_eval(tree, {"nodes": 0})
     return str(result)
+
 
 # ---------------------------------------------------------------------------
 # Network error handling (Using shared agent.http_client for efficiency)
@@ -240,28 +272,44 @@ def register_tools(agent):
         timeout=25,
     )
     async def _web_search(query: str, max_results: int = 5):
-        try:
-            response = await agent.http_client.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": query, "kl": "us-en"},
-                headers={"User-Agent": "SakuraAI/1.0"},
-            )
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "lxml")
-            results = []
-            for item in soup.select(".result")[:max(1, min(max_results, 6))]:
-                anchor = item.select_one(".result__a")
-                snippet = item.select_one(".result__snippet")
-                if not anchor:
+        last_error = None
+        for endpoint in (
+            "https://html.duckduckgo.com/html/",
+            "https://lite.duckduckgo.com/lite/",
+        ):
+            try:
+                response = await agent.http_client.get(
+                    endpoint,
+                    params={"q": query, "kl": "us-en"},
+                    headers={"User-Agent": "SakuraAI/1.0"},
+                    follow_redirects=False,
+                )
+                if response.status_code in {403, 429} or response.status_code >= 500:
+                    last_error = f"HTTP {response.status_code}"
                     continue
-                results.append({
-                    "title": anchor.get_text(" ", strip=True),
-                    "url": anchor.get("href"),
-                    "content": snippet.get_text(" ", strip=True) if snippet else "",
-                })
-            return json.dumps({"query": query, "results": results}, ensure_ascii=False)
-        except Exception as exc:
-            return f"Web search error: {exc}"
+                response.raise_for_status()
+                body_low = response.text.lower()
+                if any(marker in body_low for marker in ("captcha", "challenge", "unusual traffic")):
+                    last_error = "search provider challenge"
+                    continue
+                soup = BeautifulSoup(response.text, "lxml")
+                results = []
+                for item in soup.select(".result")[:max(1, min(max_results, 6))]:
+                    anchor = item.select_one(".result__a")
+                    snippet = item.select_one(".result__snippet")
+                    if not anchor:
+                        continue
+                    results.append({
+                        "title": anchor.get_text(" ", strip=True),
+                        "url": anchor.get("href"),
+                        "content": snippet.get_text(" ", strip=True) if snippet else "",
+                    })
+                if results:
+                    return json.dumps({"query": query, "results": results}, ensure_ascii=False)
+                last_error = "no parseable search results"
+            except Exception as exc:
+                last_error = str(exc)
+        return f"Web search error: search provider unavailable ({last_error})."
 
     @r.register(
         "get_weather",
@@ -1070,9 +1118,75 @@ def register_tools(agent):
                     "interval_minutes": d.get("interval_minutes"),
                     "enabled": bool(d.get("enabled", True)),
                     "next_check": next_check_text,
+                    "last_checked": (
+                        d.get("last_checked_at").astimezone(agent.tz).strftime("%d %b %Y at %I:%M %p %Z")
+                        if hasattr(d.get("last_checked_at"), "astimezone") else None
+                    ),
+                    "last_error": d.get("last_error"),
                 }
             )
         return json.dumps(rows, ensure_ascii=False)
+
+    @r.register(
+        "update_watch",
+        (
+            "Update an existing persistent background watch. Use after list_watches has returned the "
+            "real watch_id. Supports changing check interval or condition/query/URL. "
+            "Do not delete and recreate a watch just to change its settings."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "watch_id": {"type": "string"},
+                "interval_minutes": {"type": "integer", "minimum": 15, "maximum": 1440},
+                "condition": {"type": "string", "minLength": 2, "maxLength": 500},
+                "query": {"type": "string", "maxLength": 500},
+                "url": {"type": "string", "maxLength": 1000},
+            },
+            "required": ["watch_id"],
+            "additionalProperties": False,
+        },
+        side_effect=True,
+        timeout=20,
+    )
+    async def _update_watch(
+        watch_id: str,
+        interval_minutes: int | None = None,
+        condition: str | None = None,
+        query: str | None = None,
+        url: str | None = None,
+    ):
+        if interval_minutes is None and condition is None and query is None and url is None:
+            return "Watch update error: provide at least one setting to change."
+        if url:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return "Watch update error: URL must be a valid HTTP/HTTPS URL."
+        normalized_interval = None if interval_minutes is None else max(15, min(int(interval_minutes), 1440))
+        updated = await agent.watches.update_config(
+            watch_id,
+            agent.telegram_id,
+            interval_minutes=normalized_interval,
+            condition=condition,
+            query=query,
+            url=url,
+        )
+        if not updated:
+            return "Watch update failed: watch not found, invalid watch ID, or no settings changed."
+        next_check = updated.get("next_check_at")
+        next_check_text = (
+            next_check.astimezone(agent.tz).strftime("%d %b %Y at %I:%M %p %Z")
+            if hasattr(next_check, "astimezone") else "unknown"
+        )
+        return json.dumps({
+            "status": "updated",
+            "watch_id": str(updated.get("_id")),
+            "kind": updated.get("kind"),
+            "target": updated.get("target"),
+            "condition": updated.get("condition"),
+            "interval_minutes": updated.get("interval_minutes"),
+            "next_check": next_check_text,
+        }, ensure_ascii=False)
 
     @r.register(
         "delete_watch",
@@ -1343,13 +1457,12 @@ def register_tools(agent):
                 keyboard.append(kb_row)
 
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await agent.bot.do_api_request(
-                "sendRichMessage",
-                api_kwargs={
-                    "chat_id": agent.chat_id,
-                    "rich_message": {"markdown": text},
-                    "reply_markup": reply_markup.to_dict(),
-                },
+            # Use the official Telegram Bot API method.
+            await agent.bot.send_message(
+                chat_id=agent.chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
             )
             return "Success: Inline keyboard message delivered to chat."
         except Exception as exc:

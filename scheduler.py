@@ -145,7 +145,7 @@ class Scheduler:
             return
         if self.application.job_queue.get_jobs_by_name("daily-digest"):
             return
-        hour, minute = (int(x) for x in self.agent.settings.digest_time.split(":", 1))
+        hour, minute = 8, 0
         self.application.job_queue.run_daily(
             self._daily_digest_callback,
             time=time(hour=hour, minute=minute, tzinfo=self.tz),
@@ -156,11 +156,6 @@ class Scheduler:
     async def _daily_digest_callback(self, context):
         chat_id = context.job.data["chat_id"]
         try:
-            # respond() creates a task-local request context; do not mutate shared agent state.
-            
-            # Keep the digest useful and structured. The scheduler owns the
-            # greeting/layout so the LLM must not add another greeting or anime
-            # role-play that makes the notification repetitive.
             summary = await self.agent.respond(
                 telegram_id=chat_id,
                 chat_id=chat_id,
@@ -196,7 +191,7 @@ class Scheduler:
 
     
     def cancel_reminder(self, reminder_id: str):
-        # Find the job by the unique name we gave it during creation
+
         jobs = self.application.job_queue.get_jobs_by_name(f"reminder:{reminder_id}")
         for job in jobs:
-            job.schedule_removal() # This safely terminates the background process!
+            job.schedule_removal() 
