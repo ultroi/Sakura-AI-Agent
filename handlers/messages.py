@@ -367,6 +367,51 @@ async def deliver_final_response(
             )
 
 
+async def _respond_from_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_text: str,
+    *,
+    source_message=None,
+) -> None:
+    if not user_text.strip():
+        return
+
+    agent = context.application.bot_data["agent"]
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    await chat.send_action(ChatAction.TYPING)
+
+    thinking_stages = ("Thinking",)
+    animation_task, thinking_msg, _draft_id = await start_thinking(
+        update=update,
+        context=context,
+        stages=thinking_stages,
+    )
+
+    try:
+        answer = await agent.respond(
+            telegram_id=update.effective_user.id,
+            chat_id=chat.id,
+            user_text=user_text,
+            message=source_message or update.effective_message,
+        )
+    except Exception:
+        agent.log.exception("Inline interaction handler failed")
+        answer = "🌸 I hit a temporary internal error. Please try that again."
+    finally:
+        await stop_thinking(animation_task)
+
+    await deliver_final_response(
+        update=update,
+        context=context,
+        answer=answer,
+        thinking_message=thinking_msg,
+    )
+
+
 
 
 
@@ -387,9 +432,6 @@ async def text_handler(
 
     if not should_sakura_reply(update, context):
         return
-
-    agent = context.application.bot_data["agent"]
-    chat = update.effective_chat
 
     user_text = (
         update.message.text
@@ -443,46 +485,33 @@ async def text_handler(
         final_prompt = (
             "[System: User sent media with no caption.]"
         )
-
-    # -------------------------------------------------------------------------
-    # Start native Telegram thinking
-    # -------------------------------------------------------------------------
-    await chat.send_action(ChatAction.TYPING)
-
-    thinking_stages = (
-        "Thinking",
-
+    await _respond_from_text(
+        update,
+        context,
+        final_prompt,
+        source_message=update.effective_message,
     )
 
-    animation_task, thinking_msg, _draft_id = await start_thinking(
-        update=update,
-        context=context,
-        stages=thinking_stages,
-    )
 
-    try:
-        answer = await agent.respond(
-            telegram_id=update.effective_user.id,
-            chat_id=chat.id,
-            user_text=final_prompt,
-            message=update.effective_message,
-        )
+async def callback_query_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
 
-    except Exception:
-        agent.log.exception("Text handler failed")
-        answer = "🌸 I hit a temporary internal error. Please try that again."
+    await query.answer()
 
-    finally:
-        await stop_thinking(animation_task)
+    payload = (query.data or "").strip()
+    if not payload:
+        return
 
-    # -------------------------------------------------------------------------
-    # Final response
-    # -------------------------------------------------------------------------
-    await deliver_final_response(
-        update=update,
-        context=context,
-        answer=answer,
-        thinking_message=thinking_msg,
+    await _respond_from_text(
+        update,
+        context,
+        payload,
+        source_message=query.message,
     )
 
 

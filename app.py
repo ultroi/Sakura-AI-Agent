@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -29,7 +30,7 @@ from config import load_settings
 from database.connection import MongoDatabase
 from database.repositories import UserRepository
 from handlers.help import help_command
-from handlers.messages import text_handler, voice_handler
+from handlers.messages import callback_query_handler, text_handler, voice_handler
 from handlers.start import connect_google_command, start_command
 from scheduler import Scheduler
 from services.user_service import UserService
@@ -104,6 +105,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("connect_google", connect_google_command))
+    application.add_handler(CallbackQueryHandler(callback_query_handler))
     application.add_handler(
         MessageHandler(
             filters.VOICE & ~filters.COMMAND,
@@ -126,7 +128,7 @@ def main():
     setup_logger()
     application = build_application()
     application.run_polling(
-        allowed_updates=["message"],
+        allowed_updates=["message", "callback_query"],
         drop_pending_updates=False,
     )
 

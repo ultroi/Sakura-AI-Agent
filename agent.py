@@ -499,7 +499,7 @@ class SakuraAgent:
     MODEL_GEMINI = GEMINI_MODELS[0]
 
     MAX_TOOL_ROUNDS = 5
-    MAX_TOOL_RESULT_CHARS = 5000
+    MAX_TOOL_RESULT_CHARS = 4096
     MAX_HISTORY_CHARS = 6000
     MAX_REQUEST_CHARS = 28000
 
@@ -2327,36 +2327,24 @@ OUTPUT
                             return answer or "I couldn't generate a response."
                         except ProviderFailure as recovery_failure:
                             self.log.error(
-                                "Tool-result recovery failed with no staged tools | "
-                                "request_id=%s error=%s",
+                                "Gemini recovery failed after Groq tool-follow-up "
+                                "failure | request_id=%s error=%s",
                                 ctx.request_id,
-                                _redact_log_text(str(recovery_failure)[:700]),
+                                _redact_log_text(str(recovery_failure)[:900]),
                             )
-                            answer = (
-                                "🌸 I completed the lookup, but couldn't prepare "
-                                "the final response. Please try again."
-                            )
-                            await self.conversations.add(
-                                telegram_id,
-                                "assistant",
-                                answer,
-                            )
-                            return answer
-                    else:
-                        # Do not ask a no-tools Groq request to continue from a
-                        # tool-call transcript. Return the tool result safely.
-                        answer = (
-                            "I completed the lookup. Here are the results:\\n"
-                            + "\\n".join(
-                                str(item.get("content", "")) for item in tool_messages
-                            )
-                        )[: self.MAX_TOOL_RESULT_CHARS]
-                        await self.conversations.add(
-                            telegram_id,
-                            "assistant",
-                            answer,
-                        )
-                        return answer
+
+                    await self.conversations.add(
+                        telegram_id,
+                        "assistant",
+                        (
+                            "🌸 I completed the lookup, but couldn't prepare "
+                            "the final response. Please try again."
+                        ),
+                    )
+                    return (
+                        "🌸 I completed the lookup, but couldn't prepare "
+                        "the final response. Please try again."
+                    )
 
                 # --------------------------------------------------------
                 # FOLLOW-UP MODEL CALL AFTER TOOL EXECUTION

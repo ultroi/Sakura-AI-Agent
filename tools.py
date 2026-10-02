@@ -77,7 +77,11 @@ def _safe_eval(node, state=None):
                 raise ValueError("Division by zero is not allowed.")
             if abs(left) > 1 and right > 0:
                 if isinstance(left, int):
-                    estimated_digits = int((_int_digits(abs(left)) - 1) * right) + 1
+                    # Fix exponent estimation logic in calculate tool
+                    if left == 2:
+                        estimated_digits = _int_digits(right) - 1
+                    else:
+                        estimated_digits = int(math.floor(math.log10(abs(left)) * right)) + 1
                 else:
                     estimated_digits = int(math.floor(math.log10(abs(left)) * right)) + 1
                 if estimated_digits > _MAX_RESULT_DIGITS:
@@ -1432,6 +1436,11 @@ def register_tools(agent):
             return "Error: Telegram Bot instance not connected."
         try:
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            from telegram.constants import ParseMode
+            try:
+                from telegram import LinkPreviewOptions
+            except ImportError:
+                LinkPreviewOptions = None
 
             keyboard = []
             for row in buttons:
@@ -1458,12 +1467,15 @@ def register_tools(agent):
 
             reply_markup = InlineKeyboardMarkup(keyboard)
             # Use the official Telegram Bot API method.
-            await agent.bot.send_message(
-                chat_id=agent.chat_id,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
+            kwargs = {
+                "chat_id": agent.chat_id,
+                "text": text,
+                "reply_markup": reply_markup,
+                "parse_mode": ParseMode.MARKDOWN,
+            }
+            if LinkPreviewOptions is not None:
+                kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
+            await agent.bot.send_message(**kwargs)
             return "Success: Inline keyboard message delivered to chat."
         except Exception as exc:
             return f"Failed to send inline keyboard: {exc}"
