@@ -76,14 +76,7 @@ def _safe_eval(node, state=None):
             if left == 0 and right < 0:
                 raise ValueError("Division by zero is not allowed.")
             if abs(left) > 1 and right > 0:
-                if isinstance(left, int):
-                    # Fix exponent estimation logic in calculate tool
-                    if left == 2:
-                        estimated_digits = _int_digits(right) - 1
-                    else:
-                        estimated_digits = int(math.floor(math.log10(abs(left)) * right)) + 1
-                else:
-                    estimated_digits = int(math.floor(math.log10(abs(left)) * right)) + 1
+                estimated_digits = int(math.floor(math.log10(abs(left)) * right)) + 1
                 if estimated_digits > _MAX_RESULT_DIGITS:
                     raise ValueError("Result would be too large to calculate safely.")
             return _ALLOWED_BINOPS[type(node.op)](left, right)
@@ -361,34 +354,14 @@ def register_tools(agent):
     )
     async def _fetch_url(url: str):
         try:
-            await _assert_public_url(url)
-            response = await agent.http_client.get(
-                url,
-                follow_redirects=False,
-                headers={"User-Agent": "SakuraAI/1.0"},
-            )
-            # Do not automatically follow redirects: validate the redirect target
-            # first to prevent localhost/private-network SSRF through a public URL.
-            if 300 <= response.status_code < 400:
-                location = response.headers.get("location")
-                if not location:
-                    return "URL error: the website returned a redirect without a target."
-                from urllib.parse import urljoin
-                target = urljoin(url, location)
-                await _assert_public_url(target)
-                response = await agent.http_client.get(
-                    target,
-                    follow_redirects=False,
-                    headers={"User-Agent": "SakuraAI/1.0"},
-                )
-
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
+            status_code, headers, body, final_url = await agent._pinned_http_get(url)
+            if status_code >= 400:
+                return f"URL fetch error: the website returned HTTP {status_code}. Inform the user that the website couldn't be reached."
+            content_type = headers.get("content-type", "")
+            text = agent._decode_http_body(body, content_type, 15000)
             if "text/html" in content_type:
-                text = _clean_text(response.text)
-            else:
-                text = response.text[:15000]
-            return json.dumps({"url": str(response.url), "content_type": content_type, "text": text}, ensure_ascii=False)
+                text = _clean_text(text)
+            return json.dumps({"url": final_url, "content_type": content_type, "text": text}, ensure_ascii=False)
         except Exception as exc:
             return f"URL fetch error: {exc}. Inform the user that the website couldn't be reached."
 

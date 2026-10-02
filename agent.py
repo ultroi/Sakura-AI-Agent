@@ -6,15 +6,17 @@ import difflib
 import hashlib
 import ipaddress
 import html
+import contextlib
 import json
 import logging
 import re
 import socket
+import ssl
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 from uuid import uuid4
 
 from bson import ObjectId
@@ -644,7 +646,7 @@ class SakuraAgent:
             "tell", "me", "let", "know", "and", "is", "are", "this", "that", "page",
             "website", "watch", "monitor", "track", "please", "now",
         }
-        return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) >= 3 and w not in stop][:12]
+        return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if (len(w) >= 3 or w.isdigit()) and w not in stop][:12]
 
     async def _assert_public_url(self, url: str) -> None:
         parsed = urlparse(url)
@@ -667,6 +669,137 @@ class SakuraAgent:
             ip = ipaddress.ip_address(address)
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
                 raise ValueError("Private, local, or reserved network targets are blocked.")
+
+    async def _resolve_public_ip(self, url: str) -> tuple[str, str, int, str]:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Only public HTTP/HTTPS URLs are allowed.")
+        host = parsed.hostname.lower()
+        if host in {"localhost", "localhost.localdomain"}:
+            raise ValueError("Localhost URLs are blocked.")
+
+        try:
+            infos = await asyncio.to_thread(
+                socket.getaddrinfo,
+                host,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise ValueError("The hostname could not be resolved.") from exc
+
+        for item in infos:
+            address = item[4][0]
+            ip = ipaddress.ip_address(address)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                continue
+            return parsed.scheme, host, int(parsed.port or (443 if parsed.scheme == "https" else 80)), address
+
+        raise ValueError("No routable IP address found.")
+
+    @staticmethod
+    def _decode_http_body(body: bytes, content_type: str, max_chars: int) -> str:
+        charset_match = re.search(r"charset=([^;\s]+)", content_type, flags=re.I)
+        charset = charset_match.group(1).strip('"\'') if charset_match else "utf-8"
+        try:
+            text = body.decode(charset, errors="replace")
+        except LookupError:
+            text = body.decode("utf-8", errors="replace")
+        return text[:max_chars]
+
+    async def _pinned_http_get(
+        self,
+        url: str,
+        *,
+        max_redirects: int = 3,
+        timeout: float = 15.0,
+    ) -> tuple[int, dict[str, str], bytes, str]:
+        current_url = url
+        for _ in range(max_redirects + 1):
+            scheme, host, port, address = await self._resolve_public_ip(current_url)
+            parsed = urlparse(current_url)
+            request_target = urlunparse(("", "", parsed.path or "/", parsed.params, parsed.query, ""))
+            ssl_context = ssl.create_default_context() if scheme == "https" else None
+
+            reader = None
+            writer = None
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        host=address,
+                        port=port,
+                        ssl=ssl_context,
+                        server_hostname=host if ssl_context is not None else None,
+                    ),
+                    timeout=timeout,
+                )
+
+                request = (
+                    f"GET {request_target} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"User-Agent: SakuraAI/1.0\r\n"
+                    f"Accept-Encoding: identity\r\n"
+                    f"Connection: close\r\n\r\n"
+                )
+                writer.write(request.encode("ascii", errors="ignore"))
+                await writer.drain()
+
+                status_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                if not status_line:
+                    raise RuntimeError("The server closed the connection unexpectedly.")
+                try:
+                    _http_version, status_code_str, _reason = status_line.decode("iso-8859-1").rstrip("\r\n").split(" ", 2)
+                    status_code = int(status_code_str)
+                except Exception as exc:
+                    raise RuntimeError("Invalid HTTP response line.") from exc
+
+                headers: dict[str, str] = {}
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                    if not line or line in {b"\r\n", b"\n"}:
+                        break
+                    decoded = line.decode("iso-8859-1").rstrip("\r\n")
+                    if ":" not in decoded:
+                        continue
+                    key, value = decoded.split(":", 1)
+                    headers[key.strip().lower()] = value.strip()
+
+                if 300 <= status_code < 400:
+                    location = headers.get("location")
+                    if not location:
+                        raise RuntimeError("Website returned a redirect without a target.")
+                    current_url = urljoin(current_url, location)
+                    continue
+
+                body = bytearray()
+                transfer_encoding = headers.get("transfer-encoding", "").lower()
+                if transfer_encoding == "chunked":
+                    while True:
+                        size_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                        if not size_line:
+                            break
+                        size_text = size_line.decode("iso-8859-1").strip().split(";", 1)[0]
+                        chunk_size = int(size_text, 16)
+                        if chunk_size == 0:
+                            await asyncio.wait_for(reader.readline(), timeout=timeout)
+                            break
+                        body.extend(await asyncio.wait_for(reader.readexactly(chunk_size), timeout=timeout))
+                        await asyncio.wait_for(reader.readline(), timeout=timeout)
+                else:
+                    content_length = headers.get("content-length")
+                    if content_length is not None:
+                        body.extend(await asyncio.wait_for(reader.readexactly(int(content_length)), timeout=timeout))
+                    else:
+                        body.extend(await asyncio.wait_for(reader.read(), timeout=timeout))
+
+                return status_code, headers, bytes(body), current_url
+            finally:
+                if writer is not None:
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
+
+        raise RuntimeError("Too many redirects while fetching the watched URL.")
 
     @staticmethod
     def _parse_ddg_results(html_text: str, max_results: int) -> list[dict[str, str]]:
@@ -713,33 +846,21 @@ class SakuraAgent:
         raise RuntimeError(f"Web search temporarily unavailable: {last_error}") from last_error
 
     async def _watcher_fetch_page(self, url: str) -> tuple[str, str]:
-        current_url = url
-        for _ in range(3):
-            await self._assert_public_url(current_url)
-            response = await self.http_client.get(
-                current_url,
-                follow_redirects=False,
-                headers={"User-Agent": "SakuraAI/1.0"},
-            )
-            if 300 <= response.status_code < 400:
-                location = response.headers.get("location")
-                if not location:
-                    raise RuntimeError("Website returned a redirect without a target.")
-                current_url = urljoin(current_url, location)
-                continue
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            if "text/html" in content_type:
-                soup = BeautifulSoup(response.text, "lxml")
-                for tag in soup(["script", "style", "noscript", "svg"]):
-                    tag.decompose()
-                main = soup.select_one("main, article")
-                source = main if main is not None else soup
-                text = " ".join(source.get_text(" ", strip=True).split())[:20000]
-            else:
-                text = response.text[:20000]
-            return text, str(response.url)
-        raise RuntimeError("Too many redirects while fetching the watched URL.")
+        status_code, headers, body, final_url = await self._pinned_http_get(url)
+        if status_code >= 400:
+            raise RuntimeError(f"Website returned HTTP {status_code}.")
+        content_type = headers.get("content-type", "")
+        text = self._decode_http_body(body, content_type, 20000)
+        if "text/html" in content_type:
+            soup = BeautifulSoup(text, "lxml")
+            for tag in soup(["script", "style", "noscript", "svg"]):
+                tag.decompose()
+            main = soup.select_one("main, article")
+            source = main if main is not None else soup
+            text = " ".join(source.get_text(" ", strip=True).split())[:20000]
+        else:
+            text = text[:20000]
+        return text, final_url
 
     @staticmethod
     def _normalize_watch_content(text: str) -> str:
@@ -833,9 +954,14 @@ class SakuraAgent:
         old_text = str(last_state.get("text") or "") if isinstance(last_state, dict) else ""
         condition_terms = self._watcher_terms(condition)
         condition_hit = not condition_terms or any(term in normalized for term in condition_terms)
-        similarity = difflib.SequenceMatcher(None, old_text, normalized).ratio() if old_text else 1.0
+        condition_in_old = bool(old_text and condition_terms and any(term in old_text for term in condition_terms))
+        similarity = await asyncio.to_thread(
+            lambda: difflib.SequenceMatcher(None, old_text, normalized).ratio()
+        ) if old_text else 1.0
         # Ignore tiny/dynamic changes; alert only when stable content changes meaningfully.
-        changed = bool(old_text and similarity < 0.985 and condition_hit)
+        # If no condition terms specified, just check for similarity change.
+        # If condition terms exist, check that change is meaningful AND the term newly appears.
+        changed = bool(old_text and similarity < 0.985 and (not condition_terms or (condition_hit and not condition_in_old)))
         detail = (
             f"Your watched page changed (similarity {similarity:.1%}):\n{final_url}\n\n"
             f"Condition: {condition}"
@@ -1047,7 +1173,7 @@ class SakuraAgent:
             r"find online|browse|what happened|current price|current status|today|"
             r"right now|as of now|what's happening)\b",
             text,
-        ) and not watch_request and not service_specific_request:
+        ) and not explicit_watch_request and not service_specific_request:
             add("web_search")
 
         if re.search(r"https?://\S+", text):
@@ -1290,7 +1416,8 @@ class SakuraAgent:
         current_names: list[str],
         executed_tool: str,
     ) -> list[str]:
-        names = [name for name in current_names if name != executed_tool]
+        reusable = {"calculate", "web_search", "translate_text", "get_weather", "search_notes"}
+        names = [name for name in current_names if name != executed_tool or name in reusable]
         staged = {
             "gmail_list": ("gmail_read",),
             "gmail_read": ("gmail_send_attachment",),
@@ -1305,7 +1432,7 @@ class SakuraAgent:
             if name in self.registry.functions and name not in names:
                 names.append(name)
 
-        return names[:8]
+        return names[:14]
 
     def _select_tools_for_request(self, user_text: str) -> list[dict[str, Any]]:
         return self.registry.subset(self._select_tool_names_for_request(user_text))
@@ -1822,17 +1949,18 @@ OUTPUT
         raise ProviderFailure("gemini", detail) from last_error
 
     def _enforce_side_effect_intent(self, name: str) -> None:
-        text = self.request_context.user_text.lower()
+        ctx = self.request_context
+        text = ctx.user_text.lower()
         intent_patterns = {
             "set_reminder": r"\b(remind|reminder|alarm)\b",
-            "delete_reminder": r"\b(cancel|delete|remove)\b.*\b(reminder|alarm)\b",
-            "edit_reminder": r"\b(edit|update|change|modify|reschedule|move|postpone|snooze)\b.*\b(reminder|alarm)\b",
+            "delete_reminder": r"(?:\b(cancel|delete|remove)\b.*\b(reminder|alarm)\b|\b(?:it|that|this)\b.{0,80}(?:cancel|delete|remove))",
+            "edit_reminder": r"(?:\b(edit|update|change|modify|reschedule|move|postpone|snooze)\b.*\b(reminder|alarm)\b|\b(?:postpone|reschedule|move|snooze)\s+(?:it|that|this)\b)",
             "create_watch": r"\b(watch|monitor|track|keep an eye on|alert me when|notify me when|tell me when|let me know when|whenever|back in stock|in stock|available again|is announced)\b",
-            "update_watch": r"\b(update|edit|change|modify|adjust|set|make|switch|increase|decrease|reschedule)\b|\b(?:every\s+\d+|\d+\s*(?:hours?|days?))\b",
+            "update_watch": r"(?:\b(update|edit|change|modify|adjust|set|make|switch|increase|decrease|reschedule)\b.*(?:\b(?:watch|monitor|it|that|this)\b)?|\b(?:every\s+\d+|\d+\s*(?:hours?|days?))\b)",
             "delete_watch": r"\b(cancel|delete|remove|stop|unwatch|disable)\b.*\b(watch|monitor|tracking|it|that|this)\b|\bunwatch\b",
-            "save_note": r"\b(remember|save|store|note this|memorize)\b",
-            "update_note": r"\b(update|edit|change)\b.*\b(note|memory)\b",
-            "delete_note": r"\b(delete|remove|forget)\b.*\b(note|memory|this)\b",
+            "save_note": r"\b(remember|save|store|note|memorize)\b",
+            "update_note": r"(?:\b(update|edit|change)\b.*\b(note|memory|it|that)\b|\b(?:it|that|this)\b.{0,80}(?:update|edit|change))",
+            "delete_note": r"(?:\b(delete|remove|forget)\b.*\b(note|memory|it|that|this)\b|\b(?:forget|delete)\s+(?:it|that|this)\b)",
             "update_user_profile": r"\b(my name is|call me|my birthday|date of birth|i study|i am studying|my interests|i live in|my timezone|my preference)\b",
             "gmail_send": r"\b(send|compose|reply|forward)\b.*\b(email|mail)\b|\b(email|mail)\b.*\b(send|compose|reply|forward)\b",
             "gmail_send_attachment": r"\b(send|give|forward)\b.*\b(attachment|file)\b",
@@ -1968,10 +2096,21 @@ OUTPUT
             spec = self.registry.functions.get(name)
             if spec and spec.side_effect:
                 self._enforce_side_effect_intent(name)
-            self._enforce_tool_prerequisite(name, args)
-        except Exception as exc:
+        except ValueError as exc:
             ctx.tool_failures[name] = ctx.tool_failures.get(name, 0) + 1
             ctx.blocked_tools.add(name)
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+        except Exception as exc:
+            ctx.tool_failures[name] = ctx.tool_failures.get(name, 0) + 1
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+        try:
+            self._enforce_tool_prerequisite(name, args)
+        except ValueError as exc:
+            ctx.tool_failures[name] = ctx.tool_failures.get(name, 0) + 1
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+        except Exception as exc:
+            ctx.tool_failures[name] = ctx.tool_failures.get(name, 0) + 1
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
         async with self._tool_gate:
@@ -2150,7 +2289,7 @@ OUTPUT
                     response = await self._groq_request(
                         no_tool_messages,
                         tools=None,
-                        final=True,
+                        final=False,
                         phase="initial_no_tools",
                     )
             except ProviderFailure as first_failure:
@@ -2305,46 +2444,17 @@ OUTPUT
 
                 tools = self.registry.subset(active_tool_names)
 
-                # A completed tool with no dependent next-stage tools should not
-                # trigger another Groq tool-loop request with an empty tool set.
-                # Some compatible models hallucinate phantom tool calls in this
-                # exact situation (for example repo_browser.run_code).
                 if not tools:
-                    if self.gemini is not None:
-                        try:
-                            answer = await self._recover_with_gemini(
-                                history[:-1],
-                                system_prompt,
-                                user_text,
-                                tool_messages,
-                            )
-                            answer = sanitize_answer(answer)
-                            await self.conversations.add(
-                                telegram_id,
-                                "assistant",
-                                answer,
-                            )
-                            return answer or "I couldn't generate a response."
-                        except ProviderFailure as recovery_failure:
-                            self.log.error(
-                                "Gemini recovery failed after Groq tool-follow-up "
-                                "failure | request_id=%s error=%s",
-                                ctx.request_id,
-                                _redact_log_text(str(recovery_failure)[:900]),
-                            )
-
-                    await self.conversations.add(
-                        telegram_id,
-                        "assistant",
-                        (
-                            "🌸 I completed the lookup, but couldn't prepare "
-                            "the final response. Please try again."
-                        ),
+                    # If a tool just executed but left no successors, use Groq with
+                    # tools=None to synthesize the final answer from tool history.
+                    response = await self._groq_request(
+                        messages,
+                        tools=None,
+                        final=False,
+                        phase="tool_followup_no_next_stage",
                     )
-                    return (
-                        "🌸 I completed the lookup, but couldn't prepare "
-                        "the final response. Please try again."
-                    )
+                    # Loop back to extract final answer from the Groq response.
+                    continue
 
                 # --------------------------------------------------------
                 # FOLLOW-UP MODEL CALL AFTER TOOL EXECUTION
