@@ -1373,19 +1373,146 @@ def register_tools(agent):
         return json.dumps(meta, ensure_ascii=False)
 
 
+    def _build_inline_markup(buttons):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        if buttons is None:
+            return None
+        if not isinstance(buttons, list):
+            raise ValueError("buttons must be a 2D list.")
+        keyboard = []
+        for row in buttons:
+            if not isinstance(row, list):
+                raise ValueError("Each inline keyboard row must be a list.")
+            kb_row = []
+            for button in row:
+                if not isinstance(button, dict):
+                    raise ValueError("Each button must be an object.")
+                label = str(button.get("text") or "").strip()
+                url = button.get("url")
+                callback_data = button.get("callback_data")
+                if not label:
+                    raise ValueError("Every inline button needs text.")
+                if not url and not callback_data:
+                    raise ValueError("Every inline button needs either a URL or callback_data.")
+                if url and callback_data:
+                    raise ValueError("A button cannot contain both URL and callback_data.")
+                if callback_data is not None and len(str(callback_data).encode("utf-8")) > 64:
+                    raise ValueError("callback_data must be at most 64 UTF-8 bytes.")
+                if url is not None:
+                    parsed = urlparse(str(url))
+                    if parsed.scheme not in {"http", "https", "tg"}:
+                        raise ValueError("Inline button URLs must use http, https, or tg.")
+                kb_row.append(
+                    InlineKeyboardButton(
+                        text=label,
+                        url=str(url) if url is not None else None,
+                        callback_data=str(callback_data) if callback_data is not None else None,
+                    )
+                )
+            keyboard.append(kb_row)
+        return InlineKeyboardMarkup(keyboard)
+
+    def _message_id_from(message):
+        return int(getattr(message, "message_id", 0) or 0) if message is not None else 0
+
+    async def _resolve_ui_target():
+        """Return (message_id, current_message, saved_state)."""
+        current = agent.current_message
+        if current is not None:
+            mid = _message_id_from(current)
+            current_chat = getattr(getattr(current, "chat", None), "id", agent.chat_id)
+            markup = getattr(current, "reply_markup", None)
+            is_interactive = (
+                agent.request_context.interaction_type == "callback"
+                or bool(getattr(markup, "inline_keyboard", None))
+            )
+            if mid and int(current_chat) == int(agent.chat_id) and is_interactive:
+                return mid, current, None
+
+        latest = await agent.latest_telegram_ui()
+        if latest:
+            return int(latest.get("message_id") or 0), None, latest
+        return 0, None, None
+
     @r.register(
-        "send_inline_keyboard",
-        "Send an interactive message with clickable inline buttons. USE SPARINGLY and only when Senpai requires quick links, confirmations (Yes/No), or selection choices. Do NOT spam buttons on ordinary chats.",
+        "get_telegram_ui_context",
+        "Inspect the current/recent Telegram interactive UI state. Use this before modifying a previous menu, keyboard, pagination view, game UI, or interactive message when the exact message and buttons need to be identified.",
         {
             "type": "object",
             "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Message text above the buttons (Telegram Rich Markdown). Do not use HTML tags unless required by Telegram Rich Markdown."
-                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        timeout=15,
+    )
+    async def _get_telegram_ui_context(limit: int = 5):
+        try:
+            current = agent.current_message
+            current_info = None
+            current_markup = getattr(current, "reply_markup", None) if current is not None else None
+            current_is_interactive = bool(getattr(current_markup, "inline_keyboard", None)) or agent.request_context.interaction_type == "callback"
+            if current is not None and _message_id_from(current) and current_is_interactive:
+                buttons = []
+                for row in getattr(current_markup, "inline_keyboard", []) or []:
+                    for button in row:
+                        buttons.append({
+                            "text": getattr(button, "text", ""),
+                            "callback_data": getattr(button, "callback_data", None),
+                            "url": getattr(button, "url", None),
+                        })
+                current_info = {
+                    "message_id": _message_id_from(current),
+                    "chat_id": getattr(getattr(current, "chat", None), "id", agent.chat_id),
+                    "text": getattr(current, "text", None) or getattr(current, "caption", None) or "",
+                    "buttons": buttons,
+                    "is_callback_message": agent.request_context.interaction_type == "callback",
+                }
+
+            recent = await agent.recent_telegram_ui(limit)
+            saved = []
+            seen = set()
+            if current_info:
+                seen.add(current_info["message_id"])
+            for item in recent:
+                mid = int(item.get("message_id") or 0)
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                saved.append({
+                    "message_id": mid,
+                    "chat_id": int(item.get("chat_id") or agent.chat_id),
+                    "text": str(item.get("text") or ""),
+                    "buttons": item.get("buttons") or [],
+                    "kind": item.get("kind") or "interactive",
+                    "updated_at": str(item.get("updated_at") or ""),
+                })
+
+            return json.dumps({
+                "current": current_info,
+                "recent": saved,
+                "actions": [
+                    "send_inline_keyboard",
+                    "edit_telegram_message",
+                    "delete_telegram_message",
+                    "pin_telegram_message",
+                    "unpin_telegram_message",
+                ],
+            }, ensure_ascii=False, default=str)
+        except Exception as exc:
+            return f"Telegram UI context error: {type(exc).__name__}: {exc}"
+
+    @r.register(
+        "send_inline_keyboard",
+        "Create a new Telegram message with a dynamic inline keyboard. Use this for menus, selections, confirmations, pagination, multi-step workflows, games, and other interactive UI. For an existing interactive message, prefer edit_telegram_message instead.",
+        {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "minLength": 1, "description": "Message text in Telegram Markdown."},
                 "buttons": {
                     "type": "array",
-                    "description": "2D list representing rows of buttons. Each button must have 'text' and either 'url' or 'callback_data'.",
+                    "description": "2D list of button objects. Each button has text plus either callback_data or url.",
                     "items": {
                         "type": "array",
                         "items": {
@@ -1393,62 +1520,248 @@ def register_tools(agent):
                             "properties": {
                                 "text": {"type": "string"},
                                 "url": {"type": "string"},
-                                "callback_data": {"type": "string"}
+                                "callback_data": {"type": "string"},
                             },
-                            "required": ["text"]
-                        }
-                    }
-                }
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "kind": {"type": "string", "maxLength": 80},
             },
-            "required": ["text", "buttons"]
+            "required": ["text", "buttons"],
+            "additionalProperties": False,
         },
         side_effect=True,
     )
-    async def _send_inline_keyboard(text: str, buttons: list[list[dict]]):
+    async def _send_inline_keyboard(text: str, buttons: list[list[dict]], kind: str = "interactive"):
         if not hasattr(agent, "bot"):
             return "Error: Telegram Bot instance not connected."
         try:
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             from telegram.constants import ParseMode
-            try:
-                from telegram import LinkPreviewOptions
-            except ImportError:
-                LinkPreviewOptions = None
-
-            keyboard = []
-            for row in buttons:
-                kb_row = []
-                for b in row:
-                    url = b.get("url")
-                    callback_data = b.get("callback_data")
-                    if not url and not callback_data:
-                        raise ValueError(
-                            "Every inline button needs either a URL or callback_data."
-                        )
-                    if url and callback_data:
-                        raise ValueError(
-                            "A button cannot contain both URL and callback_data."
-                        )
-                    kb_row.append(
-                        InlineKeyboardButton(
-                            text=b["text"],
-                            url=url,
-                            callback_data=callback_data,
-                        )
-                    )
-                keyboard.append(kb_row)
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            # Use the official Telegram Bot API method.
-            kwargs = {
+            markup = _build_inline_markup(buttons)
+            sent = await agent.bot.send_message(
+                chat_id=agent.chat_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            await agent.remember_telegram_ui(
+                sent.message_id,
+                text=text,
+                buttons=buttons,
+                kind=kind,
+            )
+            return {
+                "message_id": sent.message_id,
                 "chat_id": agent.chat_id,
-                "text": text,
-                "reply_markup": reply_markup,
-                "parse_mode": ParseMode.MARKDOWN,
+                "kind": kind,
+                "_suppress_final": True,
+                "status": "created",
             }
-            if LinkPreviewOptions is not None:
-                kwargs["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
-            await agent.bot.send_message(**kwargs)
-            return "Success: Inline keyboard message delivered to chat."
         except Exception as exc:
-            return f"Failed to send inline keyboard: {exc}"
+            return f"Failed to send inline keyboard: {type(exc).__name__}: {exc}"
+
+    @r.register(
+        "edit_telegram_message",
+        "Edit an existing Telegram message dynamically. Can update text, replace the inline keyboard, remove all buttons, or do only a keyboard update. Prefer this over sending a new message when continuing an existing interactive workflow.",
+        {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "integer", "minimum": 1},
+                "text": {"type": ["string", "null"], "description": "New Markdown text. Omit/null to keep existing text when only changing buttons."},
+                "buttons": {
+                    "type": ["array", "null"],
+                    "description": "New 2D inline keyboard. [] removes all buttons. Omit/null preserves the existing keyboard.",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "url": {"type": "string"},
+                                "callback_data": {"type": "string"},
+                            },
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "kind": {"type": "string", "maxLength": 80},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        side_effect=True,
+    )
+    async def _edit_telegram_message(
+        message_id: int | None = None,
+        text: str | None = None,
+        buttons: list[list[dict]] | None = None,
+        kind: str = "interactive",
+    ):
+        if not hasattr(agent, "bot"):
+            return "Error: Telegram Bot instance not connected."
+        if text is None and buttons is None:
+            return "Edit error: provide text, buttons, or buttons=[] to remove the keyboard."
+        try:
+            from telegram.constants import ParseMode
+            mid, current, saved = await _resolve_ui_target()
+            if message_id:
+                mid = int(message_id)
+                if current is None or _message_id_from(current) != mid:
+                    current = None
+                    latest_items = await agent.recent_telegram_ui(10)
+                    saved = next((x for x in latest_items if int(x.get("message_id") or 0) == mid), None)
+            if not mid:
+                return "Edit error: no current or remembered Telegram message is available."
+
+            # None means preserve existing keyboard; [] means remove it.
+            if buttons is None:
+                if current is not None:
+                    markup = getattr(current, "reply_markup", None)
+                else:
+                    stored = (saved or {}).get("buttons") if saved else None
+                    markup = _build_inline_markup(stored) if stored is not None else None
+            else:
+                markup = _build_inline_markup(buttons)
+
+            if text is not None:
+                if current is not None:
+                    await current.edit_text(
+                        text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    await agent.bot.edit_message_text(
+                        chat_id=agent.chat_id,
+                        message_id=mid,
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+            elif buttons is not None:
+                if current is not None:
+                    await current.edit_reply_markup(reply_markup=markup)
+                else:
+                    await agent.bot.edit_message_reply_markup(
+                        chat_id=agent.chat_id,
+                        message_id=mid,
+                        reply_markup=markup,
+                    )
+
+            effective_text = text
+            if effective_text is None:
+                if current is not None:
+                    effective_text = getattr(current, "text", None) or getattr(current, "caption", None) or ""
+                else:
+                    effective_text = str((saved or {}).get("text") or "")
+
+            effective_buttons = buttons
+            if effective_buttons is None:
+                if saved is not None:
+                    effective_buttons = saved.get("buttons") or []
+                elif current is not None:
+                    effective_buttons = []
+                    markup_obj = getattr(current, "reply_markup", None)
+                    for row in getattr(markup_obj, "inline_keyboard", []) or []:
+                        effective_buttons.append([
+                            {
+                                "text": getattr(b, "text", ""),
+                                "callback_data": getattr(b, "callback_data", None),
+                                "url": getattr(b, "url", None),
+                            }
+                            for b in row
+                        ])
+            await agent.remember_telegram_ui(
+                mid,
+                text=effective_text or "",
+                buttons=effective_buttons or [],
+                kind=kind,
+            )
+            return {
+                "message_id": mid,
+                "chat_id": agent.chat_id,
+                "status": "updated",
+                "buttons_changed": buttons is not None,
+                "text_changed": text is not None,
+                "_suppress_final": True,
+            }
+        except Exception as exc:
+            return f"Edit error: {type(exc).__name__}: {exc}"
+
+    @r.register(
+        "delete_telegram_message",
+        "Delete the current or remembered Telegram message. Use this for interactive panels or messages the user explicitly asks to remove.",
+        {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "integer", "minimum": 1},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        side_effect=True,
+    )
+    async def _delete_telegram_message(message_id: int | None = None):
+        if not hasattr(agent, "bot"):
+            return "Error: Telegram Bot instance not connected."
+        try:
+            mid, current, _saved = await _resolve_ui_target()
+            if message_id:
+                mid = int(message_id)
+                if current is not None and _message_id_from(current) != mid:
+                    current = None
+            if not mid:
+                return "Delete error: no current or remembered Telegram message is available."
+            if current is not None:
+                await current.delete()
+            else:
+                await agent.bot.delete_message(chat_id=agent.chat_id, message_id=mid)
+            await agent.forget_telegram_ui(mid)
+            return {"message_id": mid, "status": "deleted", "_suppress_final": True}
+        except Exception as exc:
+            return f"Delete error: {type(exc).__name__}: {exc}"
+
+    @r.register(
+        "pin_telegram_message",
+        "Pin the current or remembered Telegram message. Requires the bot to have the required chat permissions.",
+        {"type": "object", "properties": {"message_id": {"type": "integer", "minimum": 1}}, "required": [], "additionalProperties": False},
+        side_effect=True,
+    )
+    async def _pin_telegram_message(message_id: int | None = None):
+        if not hasattr(agent, "bot"):
+            return "Error: Telegram Bot instance not connected."
+        try:
+            mid, current, _saved = await _resolve_ui_target()
+            mid = int(message_id) if message_id else mid
+            if not mid:
+                return "Pin error: no current or remembered message is available."
+            await agent.bot.pin_chat_message(chat_id=agent.chat_id, message_id=mid, disable_notification=True)
+            return {"message_id": mid, "status": "pinned", "_suppress_final": True}
+        except Exception as exc:
+            return f"Pin error: {type(exc).__name__}: {exc}"
+
+    @r.register(
+        "unpin_telegram_message",
+        "Unpin the current or remembered Telegram message.",
+        {"type": "object", "properties": {"message_id": {"type": "integer", "minimum": 1}}, "required": [], "additionalProperties": False},
+        side_effect=True,
+    )
+    async def _unpin_telegram_message(message_id: int | None = None):
+        if not hasattr(agent, "bot"):
+            return "Error: Telegram Bot instance not connected."
+        try:
+            mid, _current, _saved = await _resolve_ui_target()
+            mid = int(message_id) if message_id else mid
+            if not mid:
+                return "Unpin error: no current or remembered message is available."
+            await agent.bot.unpin_chat_message(chat_id=agent.chat_id, message_id=mid)
+            return {"message_id": mid, "status": "unpinned", "_suppress_final": True}
+        except Exception as exc:
+            return f"Unpin error: {type(exc).__name__}: {exc}"
+

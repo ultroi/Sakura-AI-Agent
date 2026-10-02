@@ -202,6 +202,9 @@ class RequestContext:
     chat_id: int
     user_text: str = ""
     message: Any | None = None
+    callback_query: Any | None = None
+    interaction_type: str = "message"
+    ui_context_active: bool = False
     known_ids: dict[str, set[str]] = field(default_factory=dict)
     tool_attempts: dict[str, int] = field(default_factory=dict)
     tool_failures: dict[str, int] = field(default_factory=dict)
@@ -493,6 +496,60 @@ class WatchRepository:
 
 
 
+class TelegramUIRepository:
+    """Persistent state for dynamically managed Telegram UI/messages."""
+
+    def __init__(self, db):
+        self.collection = db.telegram_ui_state
+
+    async def remember(
+        self,
+        telegram_id: int,
+        chat_id: int,
+        message_id: int,
+        *,
+        text: str = "",
+        buttons: list[list[dict[str, Any]]] | None = None,
+        callback_data: str | None = None,
+        kind: str = "interactive",
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        await self.collection.update_one(
+            {"telegram_id": telegram_id, "chat_id": chat_id, "message_id": int(message_id)},
+            {
+                "$set": {
+                    "telegram_id": telegram_id,
+                    "chat_id": chat_id,
+                    "message_id": int(message_id),
+                    "text": text or "",
+                    "buttons": buttons if buttons is not None else [],
+                    "callback_data": callback_data,
+                    "kind": kind,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+
+    async def latest(self, telegram_id: int, chat_id: int) -> dict[str, Any] | None:
+        return await self.collection.find_one(
+            {"telegram_id": telegram_id, "chat_id": chat_id},
+            sort=[("updated_at", -1)],
+        )
+
+    async def recent(self, telegram_id: int, chat_id: int, limit: int = 5) -> list[dict[str, Any]]:
+        cursor = self.collection.find(
+            {"telegram_id": telegram_id, "chat_id": chat_id}
+        ).sort("updated_at", -1).limit(max(1, min(limit, 10)))
+        return [doc async for doc in cursor]
+
+    async def remove(self, telegram_id: int, chat_id: int, message_id: int) -> None:
+        await self.collection.delete_one(
+            {"telegram_id": telegram_id, "chat_id": chat_id, "message_id": int(message_id)}
+        )
+
+
 class SakuraAgent:
     MODEL_GROQ = "openai/gpt-oss-120b"
     # Gemini fallback pool. 3.8 is tried first; older stable Flash models provide
@@ -526,6 +583,7 @@ class SakuraAgent:
         self.notes = NoteRepository(db)
         self.reminders = ReminderRepository(db)
         self.watches = WatchRepository(db)
+        self.telegram_ui = TelegramUIRepository(db)
         self.user_repo = UserRepository(db)
         self.google = GoogleService(settings)
         self.github = GitHubService(settings.github_token)
@@ -1027,6 +1085,65 @@ class SakuraAgent:
             except asyncio.TimeoutError:
                 pass
 
+    async def remember_telegram_ui(
+        self,
+        message_id: int,
+        *,
+        text: str = "",
+        buttons: list[list[dict[str, Any]]] | None = None,
+        callback_data: str | None = None,
+        kind: str = "interactive",
+    ) -> None:
+        await self.telegram_ui.remember(
+            self.telegram_id,
+            self.chat_id,
+            int(message_id),
+            text=text,
+            buttons=buttons,
+            callback_data=callback_data,
+            kind=kind,
+        )
+
+    async def latest_telegram_ui(self) -> dict[str, Any] | None:
+        return await self.telegram_ui.latest(self.telegram_id, self.chat_id)
+
+    async def recent_telegram_ui(self, limit: int = 5) -> list[dict[str, Any]]:
+        return await self.telegram_ui.recent(self.telegram_id, self.chat_id, limit=limit)
+
+    async def forget_telegram_ui(self, message_id: int) -> None:
+        await self.telegram_ui.remove(self.telegram_id, self.chat_id, int(message_id))
+
+    def telegram_interaction_context(self) -> str:
+        msg = self.current_message
+        query = self.request_context.callback_query
+        parts = [f"interaction_type={self.request_context.interaction_type}"]
+        if query is not None:
+            parts.append(f"callback_data={str(getattr(query, 'data', '') or '')[:500]}")
+        if msg is not None:
+            markup = getattr(msg, "reply_markup", None)
+            is_interactive = self.request_context.interaction_type == "callback" or bool(
+                getattr(markup, "inline_keyboard", None)
+            )
+            parts.append(f"current_message_id={getattr(msg, 'message_id', None)}")
+            parts.append(f"current_chat_id={getattr(getattr(msg, 'chat', None), 'id', self.chat_id)}")
+            parts.append(f"current_message_is_interactive={is_interactive}")
+            msg_text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+            if msg_text:
+                parts.append(f"current_message_text={msg_text[:1200]}")
+            buttons: list[str] = []
+            if markup is not None:
+                for row in getattr(markup, "inline_keyboard", []) or []:
+                    for button in row:
+                        label = getattr(button, "text", "")
+                        cb = getattr(button, "callback_data", None)
+                        if cb:
+                            buttons.append(f"{label} -> {cb}")
+                        elif label:
+                            buttons.append(label)
+            if buttons:
+                parts.append("current_buttons=" + " | ".join(buttons[:30]))
+        return "\n".join(parts)
+
     def _history_for_request(self, history: list[dict[str, Any]]) -> list[dict[str, str]]:
         compact: list[dict[str, str]] = []
         used = 0
@@ -1054,6 +1171,7 @@ class SakuraAgent:
         self,
         user_text: str,
         history: list[dict[str, str]] | None = None,
+        interaction_type: str = "message",
     ) -> list[str]:
         """
         Select a compact but natural-language-aware initial tool surface.
@@ -1380,13 +1498,6 @@ class SakuraAgent:
         ):
             add("search_notes")
 
-        if re.search(
-            r"\b(?:button|buttons|inline keyboard|keyboard|choice buttons|"
-            r"options buttons|yes/no buttons|interactive buttons)\b",
-            text,
-        ):
-            add("send_inline_keyboard")
-
         # Current-message media context is authoritative for image/document tools.
         if re.search(r"\b(?:analyze|analyse|read|extract|inspect|summarize)\b", text):
             if re.search(r"\b(?:image|photo|picture|screenshot)\b", text):
@@ -1395,6 +1506,62 @@ class SakuraAgent:
                 r"\b(?:document|pdf|excel|xlsx|csv|file|attachment)\b", text
             ):
                 add("analyze_document")
+
+        # Telegram interactive UI. Keep this generic: it supports menus, selectors,
+        # confirmations, pagination, games, forms, and any other dynamic workflow.
+        ui_context = bool(
+            re.search(
+                r"\b(?:button|buttons|inline keyboard|keyboard|interactive|menu|menus|"
+                r"selector|selection|quiz|pagination|dashboard|workflow)\b",
+                recent_history,
+            )
+        )
+        interactive_request = bool(
+            re.search(
+                r"\b(?:button|buttons|inline keyboard|keyboard|interactive|menu|menus|"
+                r"option|options|choose|select|selection|confirm|confirmation|pagination|"
+                r"next|previous|back|continue|same message|edit this message|"
+                r"remove buttons|replace buttons|update buttons|interactive message|"
+                r"create .*menu|make .*menu)\b",
+                text,
+            )
+        )
+        edit_ui_request = bool(
+            re.search(
+                r"\b(?:edit|update|change|modify|replace|remove|clear|refresh)\b.*"
+                r"\b(?:message|buttons?|keyboard|menu|options?|panel)\b|"
+                r"\b(?:same message|this message|previous message|that message|"
+                r"remove (?:the )?(?:buttons?|keyboard)|change (?:the )?(?:buttons?|menu))\b",
+                text,
+            )
+        )
+        delete_ui_request = bool(
+            re.search(r"\b(?:delete|remove)\b.*\b(?:message|menu|panel|keyboard|buttons?)\b", text)
+        )
+        navigation_request = bool(
+            re.search(r"\b(?:next|previous|prev|back|continue|more|less|page\s*\d+)\b", text)
+        )
+        implicit_ui_followup = ui_context and bool(
+            re.search(
+                r"\b(?:change|edit|update|modify|replace|remove|clear|refresh|next|previous|prev|back|continue|"
+                r"show|hide|open|close|select|choose|yes|no|that one|this one|option\s*\d+)\b",
+                text,
+            )
+        )
+        pin_ui_request = bool(re.search(r"\b(?:pin|unpin)\b.*\b(?:message|this|that|it)\b", text))
+
+        if interaction_type == "callback":
+            add("get_telegram_ui_context", "edit_telegram_message", "delete_telegram_message")
+        elif implicit_ui_followup or edit_ui_request or delete_ui_request or pin_ui_request:
+            add("get_telegram_ui_context")
+            if implicit_ui_followup or edit_ui_request or navigation_request:
+                add("edit_telegram_message")
+            if delete_ui_request:
+                add("delete_telegram_message")
+            if pin_ui_request:
+                add("pin_telegram_message", "unpin_telegram_message")
+        elif interactive_request:
+            add("send_inline_keyboard")
 
         if re.search(
             r"\b(?:connect google|authorize google|connect my google|google oauth)\b",
@@ -1409,7 +1576,7 @@ class SakuraAgent:
 
         # Keep the initial model context bounded, but allow a little more room
         # because natural-language routing now covers more real workflows.
-        return selected[:12]
+        return selected[:16]
 
     def _expand_tool_names_after_execution(
         self,
@@ -1426,13 +1593,14 @@ class SakuraAgent:
             "list_reminders": ("delete_reminder", "edit_reminder"),
             "list_watches": ("update_watch", "delete_watch"),
             "drive_list": ("docs_read",),
+            "get_telegram_ui_context": ("edit_telegram_message", "delete_telegram_message", "pin_telegram_message", "unpin_telegram_message"),
         }
 
         for name in staged.get(executed_tool, ()):
             if name in self.registry.functions and name not in names:
                 names.append(name)
 
-        return names[:14]
+        return names[:18]
 
     def _select_tools_for_request(self, user_text: str) -> list[dict[str, Any]]:
         return self.registry.subset(self._select_tool_names_for_request(user_text))
@@ -1454,6 +1622,7 @@ class SakuraAgent:
                 description = description[:217] + "..."
             active_tool_lines.append(f"- {name}: {description}")
         active_tools_text = "\n".join(active_tool_lines) if active_tool_lines else "- No external tools are exposed for this request."
+        telegram_context = self.telegram_interaction_context()
 
         return f"""
 You are Sakura (サクラ), Senpai's personal AI assistant inside Telegram.
@@ -1466,6 +1635,23 @@ MISSION
 Solve the user's actual request. Do not merely describe how it could be done.
 When a supplied tool can obtain the needed information or perform the requested
 action, use it and answer from the tool result.
+
+TELEGRAM DYNAMIC BEHAVIOR
+- Telegram is Sakura's execution environment, not merely an output channel.
+- Treat the CURRENT TELEGRAM CONTEXT as authoritative for the message/callback currently being handled.
+- Prefer reusing the existing interactive message for menus, selections, pagination, confirmations, forms, games, and other multi-step workflows.
+- Use get_telegram_ui_context when the user refers to a previous/current interactive message and its exact message ID or buttons are needed.
+- Use edit_telegram_message to change existing message text and/or replace/remove its inline keyboard.
+- Use delete_telegram_message when the user asks to remove an interactive message.
+- Use pin_telegram_message/unpin_telegram_message when explicitly requested.
+- Use send_inline_keyboard to create a new interactive UI when a new message is appropriate.
+- Treat callback interactions as continuations of the existing workflow. Do not start a new workflow merely because the callback payload is short or cryptic.
+- Resolve references such as "it", "that", "this button", "same message", "previous menu", "next", and "back" from the current message, callback context, persistent UI context, and recent conversation.
+- After a UI action, keep buttons aligned with the current valid state. Remove or replace stale options.
+- Do not invent message IDs, callback data, button state, or successful edits.
+- Never claim a Telegram UI mutation succeeded unless the corresponding tool returned success.
+- Keep workflow state in application/tools when available; do not rely on the model's text memory for mutable state.
+- Keep this behavior generic. Do not assume the workflow is a game; the same primitives must work for menus, quizzes, games, forms, pagination, selectors, dashboards, confirmations, and multi-step flows.
 
 CAPABILITY TRUTH
 - Every tool listed under CURRENT TOOL SURFACE is a real executable Sakura capability.
@@ -1532,6 +1718,9 @@ TOOL CHOICE
 SIDE EFFECTS
 Sending, creating, editing, deleting, scheduling, connecting, or monitoring are side effects.
 Do them only when user intent is clear and required details are available.
+
+CURRENT TELEGRAM CONTEXT
+{telegram_context}
 
 CURRENT TOOL SURFACE
 These are the actual executable tools available in this turn:
@@ -1951,6 +2140,11 @@ OUTPUT
     def _enforce_side_effect_intent(self, name: str) -> None:
         ctx = self.request_context
         text = ctx.user_text.lower()
+        if (ctx.interaction_type == "callback" or ctx.ui_context_active) and name in {
+            "send_inline_keyboard", "edit_telegram_message", "delete_telegram_message",
+            "pin_telegram_message", "unpin_telegram_message",
+        }:
+            return
         intent_patterns = {
             "set_reminder": r"\b(remind|reminder|alarm)\b",
             "delete_reminder": r"(?:\b(cancel|delete|remove)\b.*\b(reminder|alarm)\b|\b(?:it|that|this)\b.{0,80}(?:cancel|delete|remove))",
@@ -1968,7 +2162,11 @@ OUTPUT
             "github_create_issue": r"\b(create|open|file|report|make)\b.*\bissue\b",
             "connect_google": r"\b(connect|authorize)\b.*\bgoogle\b",
             "send_telegram_media": r"\b(send|return|give|forward)\b.*\b(photo|image|video|document|file|voice)\b",
-            "send_inline_keyboard": r"\b(button|buttons|keyboard|choice|select|yes/no|options)\b",
+            "send_inline_keyboard": r"\b(button|buttons|keyboard|choice|select|yes/no|options|menu|interactive)\b",
+            "edit_telegram_message": r"\b(?:edit|update|change|modify|replace|remove|clear|refresh)\b.*(?:\b(?:message|button|buttons|keyboard|menu|option|options)\b)|\b(?:same message|this message|previous message|that message)\b",
+            "delete_telegram_message": r"\b(?:delete|remove)\b.*\b(?:message|menu|panel|keyboard|buttons?)\b",
+            "pin_telegram_message": r"\bpin\b.*\b(?:message|this|that|it)\b",
+            "unpin_telegram_message": r"\bunpin\b.*\b(?:message|this|that|it)\b",
         }
         pattern = intent_patterns.get(name)
         if pattern and not re.search(pattern, text, flags=re.I):
@@ -1976,6 +2174,17 @@ OUTPUT
 
     def _enforce_tool_prerequisite(self, name: str, args: dict[str, Any]) -> None:
         ctx = self.request_context
+        if name in {
+            "edit_telegram_message", "delete_telegram_message",
+            "pin_telegram_message", "unpin_telegram_message",
+        } and args.get("message_id") is not None:
+            supplied = str(args.get("message_id")).strip()
+            current = str(getattr(ctx.message, "message_id", "") or "")
+            if supplied != current and not ctx.knows("telegram_message_id", supplied):
+                raise ValueError(
+                    f"{name} refused to use an unknown Telegram message_id. Use the current callback/message or a message_id returned by get_telegram_ui_context."
+                )
+
         prerequisites = {
             "gmail_read": (("message_id", "message_id"),),
             "gmail_send_attachment": (("message_id", "message_id"), ("attachment_id", "attachment_id")),
@@ -2057,6 +2266,8 @@ OUTPUT
             ctx.remember("watch_id", *self._extract_ids(data, {"id", "watch_id"}))
         elif tool_name == "drive_list":
             ctx.remember("document_id", *self._extract_ids(data, {"id", "document_id"}))
+        elif tool_name in {"get_telegram_ui_context", "send_inline_keyboard", "edit_telegram_message"}:
+            ctx.remember("telegram_message_id", *self._extract_ids(data, {"message_id", "telegram_message_id"}))
 
     @staticmethod
     def _extract_ids(value: Any, keys: set[str]) -> list[str]:
@@ -2198,6 +2409,21 @@ OUTPUT
             f"{type(last_error).__name__}: {last_error}" if last_error else "Unknown Gemini error.",
         ) from last_error
 
+    def _tool_suppresses_final(self, result: str, tool_name: str) -> bool:
+        try:
+            payload = json.loads(result)
+        except Exception:
+            return False
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return False
+        data = payload.get("data")
+        if isinstance(data, dict) and data.get("_suppress_final"):
+            # Creating a new UI can still be followed by a concise confirmation.
+            # Editing/deleting/pinning an existing UI, or handling a callback, is
+            # already the user-visible response and should not create a second message.
+            return tool_name != "send_inline_keyboard" or self.request_context.interaction_type == "callback"
+        return False
+
     async def respond(
         self,
         telegram_id: int,
@@ -2205,6 +2431,7 @@ OUTPUT
         user_text: str,
         *,
         message: Any | None = None,
+        callback_query: Any | None = None,
     ) -> str:
         ctx = RequestContext(
             request_id=uuid4().hex[:12],
@@ -2212,8 +2439,14 @@ OUTPUT
             chat_id=chat_id,
             user_text=user_text,
             message=message,
+            callback_query=callback_query,
+            interaction_type="callback" if callback_query is not None else "message",
         )
         token = self._request_context.set(ctx)
+        if message is not None:
+            current_message_id = getattr(message, "message_id", None)
+            if current_message_id:
+                ctx.remember("telegram_message_id", str(current_message_id))
         self.ensure_watcher_worker()
 
         try:
@@ -2227,9 +2460,25 @@ OUTPUT
             )
             profile = await self.user_repo.get_profile(telegram_id)
 
+            prior_text = " ".join(
+                str(item.get("content") or "")
+                for item in history[:-1]
+                if item.get("role") in {"user", "assistant"}
+            ).lower()
+            ctx.ui_context_active = bool(
+                re.search(r"\b(?:button|buttons|inline keyboard|keyboard|interactive|menu|menus|"
+                          r"selector|pagination|quiz|dashboard|workflow)\b", prior_text)
+                and re.search(r"\b(?:change|edit|update|modify|replace|remove|clear|refresh|next|previous|prev|back|continue|"
+                              r"show|hide|open|close|select|choose|yes|no|that one|this one|option\s*\d+|it|that|this)\b", user_text.lower())
+            )
+
             # Give the router recent conversation context so follow-ups such as
             # "change it to 24 hours" can resolve the existing watch/reminder object.
-            active_tool_names = self._select_tool_names_for_request(user_text, history[:-1])
+            active_tool_names = self._select_tool_names_for_request(
+                user_text,
+                history[:-1],
+                interaction_type=ctx.interaction_type,
+            )
             tools = self.registry.subset(active_tool_names)
             system_prompt = self._build_system_prompt(profile, active_tool_names)
 
@@ -2424,6 +2673,7 @@ OUTPUT
                             ensure_ascii=False,
                         )
 
+                    suppress_final = self._tool_suppresses_final(result, tc.function.name)
                     result = result[: self.MAX_TOOL_RESULT_CHARS]
 
                     tool_message = {
@@ -2441,6 +2691,13 @@ OUTPUT
                             active_tool_names,
                             tc.function.name,
                         )
+                    if suppress_final and self._tool_result_ok(result):
+                        await self.conversations.add(
+                            telegram_id,
+                            "assistant",
+                            "[Telegram UI action completed]",
+                        )
+                        return "__SAKURA_SILENT_UI__"
 
                 tools = self.registry.subset(active_tool_names)
 

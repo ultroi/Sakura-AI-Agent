@@ -373,6 +373,7 @@ async def _respond_from_text(
     user_text: str,
     *,
     source_message=None,
+    callback_query=None,
 ) -> None:
     if not user_text.strip():
         return
@@ -397,12 +398,22 @@ async def _respond_from_text(
             chat_id=chat.id,
             user_text=user_text,
             message=source_message or update.effective_message,
+            callback_query=callback_query,
         )
     except Exception:
         agent.log.exception("Inline interaction handler failed")
         answer = "🌸 I hit a temporary internal error. Please try that again."
     finally:
         await stop_thinking(animation_task)
+
+    # Telegram UI tools may have already completed the user-visible action by
+    # editing/sending/deleting the interactive message. Do not create a second
+    # assistant message in that case.
+    if answer == "__SAKURA_SILENT_UI__":
+        if thinking_msg is not None:
+            with contextlib.suppress(TelegramError):
+                await thinking_msg.delete()
+        return
 
     await deliver_final_response(
         update=update,
@@ -512,6 +523,7 @@ async def callback_query_handler(
         context,
         payload,
         source_message=query.message,
+        callback_query=query,
     )
 
 
