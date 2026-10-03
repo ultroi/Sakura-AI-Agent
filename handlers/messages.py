@@ -12,7 +12,6 @@ from telegram.ext import ContextTypes
 from handlers.helpers import (
     is_owner,
     rich_markdown_to_html,
-    send_response_safely,
     should_sakura_reply,
 )
 
@@ -153,6 +152,8 @@ async def animate_native_thinking(
         # If Telegram temporarily rejects a draft update, stop the animation
         # quietly. The main request must still be allowed to finish.
         return
+
+
 
 
 async def animate_legacy_thinking(
@@ -307,6 +308,23 @@ async def send_rich_final_response(
             },
         },
     )
+
+
+async def send_response_safely(message_to_edit, full_text: str, chat):
+    """Edits the placeholder message with the first chunk, and sends any overflow chunks as new messages."""
+    # The normal answer contract is Rich Markdown. When Rich Messages are
+    # unavailable, translate it to Telegram-compatible regular HTML first.
+    rendered_text = rich_markdown_to_html(full_text)
+    chunks = split_text_safely(rendered_text)
+    if not chunks:
+        chunks = ["(Empty response)"]
+
+    # Edit the initial thinking message with the first chunk
+    await message_to_edit.edit_text(chunks[0], parse_mode=ParseMode.HTML)
+
+    # Send any subsequent chunks as fresh messages
+    for overflow_chunk in chunks[1:]:
+        await chat.send_message(overflow_chunk, parse_mode=ParseMode.HTML)
 
 
 async def deliver_final_response(
