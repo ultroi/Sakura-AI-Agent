@@ -1173,21 +1173,6 @@ class SakuraAgent:
         history: list[dict[str, str]] | None = None,
         interaction_type: str = "message",
     ) -> list[str]:
-        """
-        Select a compact but natural-language-aware initial tool surface.
-
-        The model is responsible for deciding the exact tool call from the tools
-        supplied here. This router's job is only to make the likely capability
-        available. It therefore recognizes normal conversational phrasing rather
-        than requiring exact command-like keywords.
-
-        Dependent tools remain staged:
-          gmail_list -> gmail_read -> gmail_send_attachment
-          search_notes/recent_notes -> update/delete_note
-          list_reminders -> delete_reminder/edit_reminder
-          list_watches -> delete_watch
-          drive_list -> docs_read
-        """
         text = re.sub(r"\s+", " ", (user_text or "").lower()).strip()
         history = history or []
         recent_history = " ".join(
@@ -1246,35 +1231,77 @@ class SakuraAgent:
         )
         watch_context = bool(
             re.search(
-                r"\b(?:watch|monitor|watching|monitoring|tracking|next check|checking interval|"
-                r"check interval|watch id|persistent monitor)\b",
-                recent_history,
+            r"\b(?:watch|monitor|watching|monitoring|tracking|next check|checking interval|"
+            r"check interval|watch id|persistent monitor|background watch)\b",
+            recent_history,
             )
         )
+
+        watch_management_request = bool(
+            re.search(
+            r"\b(?:watch|monitor|monitoring|watching|tracking|"
+            r"background watch|persistent monitor|my watches|my monitors)\b",
+            text,
+            )
+        )
+
         watch_status_query = bool(
             re.search(
-                r"\b(?:interval|frequency|how often|current monitor|current watch|exact detail|details|"
-                r"status|next check|checking|when does it check|what is it checking|is it active|"
-                r"am i watching|did i ask you to monitor|already monitoring|do you have me watching)\b",
-                text,
+            r"\b(?:interval|frequency|how often|current monitor|current watch|"
+            r"exact detail|details|status|next check|checking|"
+            r"when does it check|what is it checking|is it active|"
+            r"am i watching|did i ask you to monitor|"
+            r"already monitoring|do you have me watching)\b",
+            text,
             )
         )
+
         watch_edit_query = bool(
             re.search(
-                r"\b(?:change|edit|update|modify|adjust|set|make|switch|increase|decrease|reschedule)\b.*"
-                r"(?:interval|frequency|hour|hours|day|days|checking|watch|monitor|it|that|this)",
+            r"\b(?:change|edit|update|modify|adjust|set|make|switch|"
+            r"increase|decrease|reschedule)\b",
+            text,
+            )
+            and (
+            watch_management_request
+            or watch_context
+            or re.search(
+                r"\b(?:interval|frequency|every\s+\d+|"
+                r"\d+\s*(?:minutes?|hours?|days?))\b",
                 text,
             )
-            or re.search(r"\b(?:every\s+\d+|\d+\s*(?:hours?|days?))\b", text)
+            )
         )
-        watch_delete = bool(re.search(r"\b(?:stop|cancel|delete|remove|unwatch|disable)\b", text))
+
+        watch_delete = bool(
+            re.search(
+            r"\b(?:stop|cancel|delete|remove|unwatch|disable)\b",
+            text,
+            )
+            and (watch_management_request or watch_context)
+        )
+
         delegated_watch_edit = bool(
-            watch_context
-            and re.search(r"\b(?:as you wish|your choice|you decide|whatever you prefer|whatever suits you|up to you)\b", text)
+            (watch_context or watch_management_request)
+            and re.search(
+            r"\b(?:as you wish|your choice|you decide|"
+            r"whatever you prefer|whatever suits you|up to you)\b",
+            text,
+            )
         )
-        if explicit_watch_request and not watch_delete:
+
+        if explicit_watch_request and not watch_delete and not watch_edit_query:
             add("create_watch")
-        if watch_context and (watch_status_query or watch_edit_query or watch_delete or delegated_watch_edit):
+
+        if (
+            watch_context
+            or watch_management_request
+        ) and (
+            watch_status_query
+            or watch_edit_query
+            or watch_delete
+            or delegated_watch_edit
+        ):
             add("list_watches")
 
         service_specific_request = bool(
