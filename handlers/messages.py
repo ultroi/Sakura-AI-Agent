@@ -530,6 +530,11 @@ async def callback_query_handler(
     if not query:
         return
 
+    if query.message and query.message.chat.type == ChatType.PRIVATE:
+        if not is_owner(update, context):
+            await query.answer("Not authorized.", show_alert=False)
+            return
+
     await query.answer()
 
     payload = (query.data or "").strip()

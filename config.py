@@ -18,6 +18,7 @@ class Settings:
     mongodb_db: str
     gemini_api_key: str | None
     github_token: str | None
+    tavily_api_key: str | None
     timezone: str
     digest_time: str
     owner_telegram_id: int
@@ -40,6 +41,7 @@ def load_settings() -> Settings:
         mongodb_db=os.getenv("MONGODB_DB", "sakura").strip() or "sakura",
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip() or None,
         github_token=os.getenv("GITHUB_TOKEN", "").strip() or None,
+        tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip() or None,
         timezone=os.getenv("TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata",
         digest_time=os.getenv("DIGEST_TIME", "08:00").strip() or "08:00",
         owner_telegram_id=int(_required("OWNER_TELEGRAM_ID")),

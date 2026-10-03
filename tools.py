@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+from handlers.helpers import rich_markdown_to_html
 
 
 class ToolExecutionError(RuntimeError):
@@ -153,6 +154,15 @@ def _resolve_media_message(agent):
         if getattr(reply, "photo", None) or getattr(reply, "document", None):
             return reply
     return msg
+
+
+async def _profile_field(agent, field: str):
+    try:
+        profile = await agent.user_repo.get_profile(agent.telegram_id)
+        value = profile.get(field) if isinstance(profile, dict) else None
+        return str(value).strip() if value else None
+    except Exception:
+        return None
 
 
 def _media_descriptor(message):
@@ -304,10 +314,13 @@ def register_tools(agent):
     @r.register(
         "get_weather",
         "Get current weather and today's forecast for a city (Open-Meteo).",
-        {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        {"type": "object", "properties": {"city": {"type": ["string", "null"]}}, "required": []},
     )
-    async def _weather(city: str):
+    async def _weather(city: str | None = None):
         try:
+            city = (city or await _profile_field(agent, "location") or "").strip()
+            if not city:
+                raise ToolExecutionError("Weather error: no city was supplied and no saved profile location is available.")
             geo = await _http_get_json(agent, "https://geocoding-api.open-meteo.com/v1/search", {"name": city, "count": 1, "language": "en", "format": "json"})
             results = geo.get("results", [])
             if not results:
@@ -695,16 +708,20 @@ def register_tools(agent):
         {
             "type": "object",
             "properties": {
-                "origin": {"type": "string", "minLength": 2, "maxLength": 250},
+                "origin": {"type": ["string", "null"], "minLength": 2, "maxLength": 250},
                 "destination": {"type": "string", "minLength": 2, "maxLength": 250},
             },
-            "required": ["origin", "destination"],
+            "required": ["destination"],
             "additionalProperties": False,
         },
         timeout=30,
     )
-    async def _get_directions(origin: str, destination: str):
+    async def _get_directions(origin: str | None, destination: str):
         try:
+            origin = (origin or await _profile_field(agent, "location") or "").strip()
+            if not origin:
+                raise ToolExecutionError("Directions error: no origin was supplied and no saved profile location is available.")
+
             async def geocode(place: str):
                 data = await _http_get_json(
                     agent,
@@ -767,6 +784,10 @@ def register_tools(agent):
     )
     async def _search_places(query: str, max_results: int = 5):
         try:
+            query = query.strip()
+            profile_location = await _profile_field(agent, "location")
+            if profile_location and not re.search(r"\b(?:in|near|at)\s+", query, re.IGNORECASE):
+                query = f"{query} near {profile_location}"
             data = await _http_get_json(
                 agent,
                 "https://nominatim.openstreetmap.org/search",
@@ -806,6 +827,10 @@ def register_tools(agent):
         },
     )
     async def _get_map_link(query: str):
+        query = query.strip()
+        profile_location = await _profile_field(agent, "location")
+        if profile_location and not re.search(r"\b(?:in|near|at)\s+", query, re.IGNORECASE):
+            query = f"{query} near {profile_location}"
         safe_q = quote(query)
         return json.dumps(
             {
@@ -1386,6 +1411,19 @@ def register_tools(agent):
             raise ToolExecutionError(f"Failed to send {file_type}: {exc}")
 
     @r.register(
+        "get_current_media_file_id",
+        "Get the Telegram file_id for the current or replied-to media message so it can be reused by send_telegram_media.",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    )
+    async def _get_current_media_file_id():
+        try:
+            message = _resolve_media_message(agent)
+            meta = _media_descriptor(message)
+            return json.dumps(meta, ensure_ascii=False)
+        except Exception as exc:
+            raise ToolExecutionError(f"Media ID error: {type(exc).__name__}: {exc}")
+
+    @r.register(
         "analyze_image",
         "Analyze the image on the current or replied-to message.",
         {
@@ -1789,9 +1827,9 @@ def register_tools(agent):
             markup = _build_inline_markup(buttons)
             sent = await agent.bot.send_message(
                 chat_id=agent.chat_id,
-                text=text,
+                text=rich_markdown_to_html(text),
                 reply_markup=markup,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
             await agent.remember_telegram_ui(
@@ -1900,8 +1938,8 @@ def register_tools(agent):
             if text is not None:
                 if current is not None:
                     await current.edit_text(
-                        text,
-                        parse_mode=ParseMode.MARKDOWN,
+                        rich_markdown_to_html(text),
+                        parse_mode=ParseMode.HTML,
                         reply_markup=markup,
                         disable_web_page_preview=True,
                     )
@@ -1909,8 +1947,8 @@ def register_tools(agent):
                     await agent.bot.edit_message_text(
                         chat_id=agent.chat_id,
                         message_id=mid,
-                        text=text,
-                        parse_mode=ParseMode.MARKDOWN,
+                        text=rich_markdown_to_html(text),
+                        parse_mode=ParseMode.HTML,
                         reply_markup=markup,
                         disable_web_page_preview=True,
                     )

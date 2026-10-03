@@ -198,7 +198,7 @@ class GoogleService:
             # Extract body text snippet
             if part.get("mimeType") == "text/plain" and "data" in body:
                 try:
-                    data = body["data"] + "=" * (4 - len(body["data"]) % 4)
+                    data = body["data"] + "=" * (-len(body["data"]) % 4)
                     body_text += base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore") + "\n"
                 except Exception:
                     pass
@@ -230,7 +230,7 @@ class GoogleService:
         
         file_data = att["data"]
         # Add padding to ensure safe decoding
-        padded_data = file_data + '=' * (4 - len(file_data) % 4)
+        padded_data = file_data + '=' * (-len(file_data) % 4)
         return base64.urlsafe_b64decode(padded_data)
 
     def gmail_send(self, to: str, subject: str, body: str) -> dict:

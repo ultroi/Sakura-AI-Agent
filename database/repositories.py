@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bson import ObjectId
@@ -352,6 +352,8 @@ class ConversationStateRepository:
                 "active_entity_id": None,
                 "intent_history": [],
                 "pending_confirmation": None,
+                "conversation_summary": "",
+                "conversation_summary_message_count": 0,
             }
         doc.pop("_id", None)
         return doc
@@ -400,6 +402,18 @@ class ConversationStateRepository:
         await self.collection.update_one(
             {"telegram_id": telegram_id},
             {"$set": updates, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+
+    async def set_summary(self, telegram_id: int, summary: str, message_count: int = 0) -> None:
+        clean = str(summary or "").strip()[:5000]
+        await self.collection.update_one(
+            {"telegram_id": telegram_id},
+            {"$set": {
+                "conversation_summary": clean,
+                "conversation_summary_message_count": int(message_count),
+                "updated_at": datetime.now(timezone.utc),
+            }},
             upsert=True,
         )
 

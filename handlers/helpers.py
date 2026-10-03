@@ -153,9 +153,10 @@ def should_sakura_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     if not chat or not message:
         return False
 
-    # Private chat me hamesha reply karegi
+    # Sakura is owner-only in private chats as well as owner-only when
+    # addressed in groups/supergroups.
     if chat.type == ChatType.PRIVATE:
-        return True
+        return is_owner(update, context)
 
     # Group / Supergroup logic
     if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:

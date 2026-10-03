@@ -51,6 +51,7 @@ async def post_init(application: Application):
 
     scheduler = Scheduler(application, agent)
     application.bot_data["scheduler"] = scheduler
+    agent.scheduler = scheduler
 
     await scheduler.restore_reminders()
 

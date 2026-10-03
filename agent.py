@@ -9,6 +9,7 @@ import contextlib
 import json
 import logging
 import re
+import os
 import socket
 import ssl
 import time
@@ -47,6 +48,11 @@ from database.repositories import (
 )
 from semantic_memory import SemanticNoteIndex
 from self_state import SelfStateStore
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:  # Optional on low-memory/free-tier deployments.
+    SentenceTransformer = None
 from services.google_service import GoogleService
 from services.github_service import GitHubService
 from utils.logger import setup_logger
@@ -414,6 +420,9 @@ class SakuraAgent:
     MAX_TOOL_RESULT_CHARS = 2_500
     MAX_HISTORY_CHARS = 4_000
     MAX_REQUEST_CHARS = 40_000
+    RECENT_HISTORY_MESSAGES = 6
+    CONVERSATION_SUMMARY_THRESHOLD = 12
+    TOOL_ROUTER_TOP_K = 8
 
     WATCH_NOTIFICATION_COOLDOWN_MINUTES = 360
     WATCH_FAILURE_ALERT_THRESHOLD = 3
@@ -480,6 +489,19 @@ class SakuraAgent:
         )
         self._watcher_task: asyncio.Task | None = None
         self._watcher_stop = asyncio.Event()
+        self.scheduler = None
+
+        # Keep strong references to background summary tasks. A per-user mapping
+        # also prevents multiple concurrent summary calls for the same user.
+        self._summary_tasks: dict[int, asyncio.Task] = {}
+
+        # Semantic router is lazy and opt-in; this keeps free/low-memory
+        # deployments from loading a transformer unless explicitly enabled.
+        self._tool_router_model = None
+        self._tool_router_embeddings = None
+        self._tool_router_names: list[str] = []
+        self._tool_router_lock = asyncio.Lock()
+
         self._static_system_prompt = self._build_static_system_prompt()
 
     @property
@@ -515,6 +537,16 @@ class SakuraAgent:
     def now(self) -> datetime:
         return datetime.now(self.tz)
 
+    def schedule_reminder(self, *args, **kwargs):
+        if self.scheduler is None:
+            raise RuntimeError("Reminder scheduler is not initialized.")
+        return self.scheduler.schedule_reminder(*args, **kwargs)
+
+    def cancel_reminder(self, reminder_id: str):
+        if self.scheduler is None:
+            raise RuntimeError("Reminder scheduler is not initialized.")
+        return self.scheduler.cancel_reminder(reminder_id)
+
     async def aclose(self) -> None:
         self._watcher_stop.set()
         if self._watcher_task is not None and not self._watcher_task.done():
@@ -523,6 +555,14 @@ class SakuraAgent:
                 await self._watcher_task
             except asyncio.CancelledError:
                 pass
+
+        summary_tasks = [task for task in self._summary_tasks.values() if not task.done()]
+        for task in summary_tasks:
+            task.cancel()
+        if summary_tasks:
+            await asyncio.gather(*summary_tasks, return_exceptions=True)
+        self._summary_tasks.clear()
+
         await self.http_client.aclose()
         if self.gemini is not None and hasattr(self.gemini, "aio"):
             await self.gemini.aio.aclose()
@@ -1137,84 +1177,126 @@ class SakuraAgent:
         }
         return mapping.get(name, name.rsplit("_", 1)[0])
 
-    def _select_tool_names_for_request(
+    def _tool_router_text(self, name: str) -> str:
+        spec = self.registry.functions.get(name)
+        if not spec:
+            return name.replace("_", " ")
+        return f"{name.replace('_', ' ')}. {spec.description}"
+
+    async def _ensure_tool_router_embeddings(self) -> bool:
+        """Lazily load sentence-transformers when explicitly enabled."""
+        if os.getenv("SAKURA_TOOL_ROUTER", "off").strip().lower() not in {"1", "true", "yes", "embedding"}:
+            return False
+        if SentenceTransformer is None:
+            return False
+        async with self._tool_router_lock:
+            if self._tool_router_model is not None and self._tool_router_embeddings is not None:
+                return True
+            try:
+                names = sorted(self.registry.functions)
+                texts = [self._tool_router_text(name) for name in names]
+
+                def _load():
+                    model = SentenceTransformer(
+                        os.getenv("SAKURA_TOOL_ROUTER_MODEL", "all-MiniLM-L6-v2")
+                    )
+                    embeddings = model.encode(texts, normalize_embeddings=True)
+                    return model, embeddings
+
+                model, embeddings = await asyncio.to_thread(_load)
+                self._tool_router_model = model
+                self._tool_router_embeddings = embeddings
+                self._tool_router_names = names
+                return True
+            except Exception as exc:
+                self.log.warning("Semantic tool router unavailable: %s", _redact_log_text(str(exc)[:500]))
+                self._tool_router_model = None
+                self._tool_router_embeddings = None
+                self._tool_router_names = []
+                return False
+
+    async def _semantic_tool_candidates(self, user_text: str, top_k: int) -> list[str]:
+        ready = await self._ensure_tool_router_embeddings()
+        if not ready:
+            return []
+        try:
+            query_vec = await asyncio.to_thread(
+                self._tool_router_model.encode,
+                [user_text],
+                normalize_embeddings=True,
+            )
+            scores = (self._tool_router_embeddings @ query_vec[0]).tolist()
+            ranked = sorted(
+                zip(self._tool_router_names, scores),
+                key=lambda pair: pair[1],
+                reverse=True,
+            )
+            return [name for name, score in ranked[:top_k] if score >= 0.28]
+        except Exception:
+            return []
+
+    def _regex_tool_names_for_request(
         self,
         user_text: str,
         history: list[dict[str, str]] | None = None,
         interaction_type: str = "message",
     ) -> list[str]:
-        """Select only tools relevant to the current turn.
-
-        Keep routing deterministic and cheap: clear action/data intents use
-        regex rules; ambiguous general questions receive no tools by default.
-        History is considered only for short contextual follow-ups, not used as
-        a blanket source of triggers for every new message.
-        """
         text = (user_text or "").strip().lower()
         selected: set[str] = set()
 
         def matches(*patterns: str) -> bool:
             return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
-        # A short follow-up can inherit the prior topic when it contains a
-        # reference such as "do that". Avoid scanning all history for keywords.
         contextual = len(text.split()) <= 8 and matches(
             r"\b(it|that|those|same|there|do this|do that|go ahead)\b"
         )
+        prior = ""
         if contextual and history:
-            previous_user = next(
-                (str(item.get("content") or "").lower()
-                 for item in reversed(history)
-                 if item.get("role") == "user"),
+            prior = next(
+                (str(item.get("content") or "").lower() for item in reversed(history) if item.get("role") == "user"),
                 "",
             )
-            prior = previous_user
-        else:
-            prior = ""
 
-        # Time/date: only when the user asks for current or relative time/date.
-        if matches(
-            r"\b(what time is it|current time|time right now|what is the time)\b",
-            r"\b(today'?s date|what date is it|current date|what day is (it|today))\b",
-            r"\b(how many days until|days left until|what time will it be)\b",
-        ):
+        if matches(r"\b(what time is it|current time|time right now|what is the time)\b",
+                   r"\b(today'?s date|what date is it|current date|what day is (it|today))\b",
+                   r"\b(how many days until|days left until|what time will it be)\b"):
             selected.add("current_time")
 
-        # Notes: distinguish saving from searching. Do not load either by default.
-        if matches(
-            r"\b(save|remember|store|keep|write down|make)\b.{0,45}\b(note|this|that|it)\b",
-            r"\b(note this|save this|remember this|keep this in mind)\b",
-        ):
+        if matches(r"\b(save|remember|store|keep|write down|make)\b.{0,45}\b(note|this|that|it)\b",
+                   r"\b(note this|save this|remember this|keep this in mind)\b"):
             selected.add("save_note")
-        if matches(
-            r"\b(find|search|show|list|read|retrieve|recall)\b.{0,50}\b(my )?(notes?|memoirs?)\b",
-            r"\b(what did i (save|note|write down|ask you to remember))\b",
-        ):
-            selected.add("search_notes")
+        if matches(r"\b(find|search|show|list|read|retrieve|recall)\b.{0,50}\b(my )?(notes?|memos?)\b",
+                   r"\b(what did i (save|note|write down|ask you to remember))\b"):
+            selected.update({"search_notes", "recent_notes"})
+        if matches(r"\b(update|edit|change)\b.{0,40}\b(note|memory)\b"):
+            selected.add("update_note")
+        if matches(r"\b(delete|remove)\b.{0,40}\b(note|memory)\b"):
+            selected.add("delete_note")
+        if matches(r"\b(my name is|i am called|call me|i live in|i am from|my birthday|my date of birth|i study|i am studying|my timezone|remember (that )?i)\b"):
+            selected.add("update_user_profile")
 
-        # Web search is for explicit online/live/recent information requests.
-        if matches(
-            r"\b(search (the )?(web|internet|online)|look (it )?up online|google (for|this))\b",
-            r"\b(latest|current|today'?s|recent|breaking)\b.{0,50}\b(news|price|release|version|update|weather|result|status)\b",
-            r"\b(news|price|release|version|update|weather|result|status)\b.{0,50}\b(latest|current|today|recent|right now)\b",
-        ):
+        if matches(r"\b(search (the )?(web|internet|online)|look (it )?up online|google (for|this))\b",
+                   r"\b(latest|current|today'?s|recent|breaking)\b.{0,50}\b(news|price|release|version|update|weather|result|status)\b",
+                   r"\b(news|price|release|version|update|weather|result|status)\b.{0,50}\b(latest|current|today|recent|right now)\b"):
             selected.add("web_search")
-
-        # Calculator: explicit calculation language or a numeric expression.
-        # Conceptual questions such as "What is machine learning?" do not match.
-        if matches(
-            r"\b(calculate|compute|work out|evaluate|solve (this|the equation|for x))\b",
-            r"\b(what is|how much is)\s+[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%\s+of|[+*/×÷-])\s*[-+]?\d",
-            r"\b\d+(?:\.\d+)?\s*(?:%\s+of|[+*/×÷-])\s*\d+(?:\.\d+)?\b",
-        ):
+        if matches(r"https?://\S+", r"\b(open|fetch|read|load)\b.{0,30}\b(url|link|website|page)\b"):
+            selected.add("fetch_url")
+        if matches(r"\b(translate|translation)\b"):
+            selected.add("translate_text")
+        if matches(r"\b(calculate|compute|work out|evaluate|solve (this|the equation|for x))\b",
+                   r"\b(what is|how much is)\s+[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%\s+of|[+*/×÷-])\s*[-+]?\d",
+                   r"\b\d+(?:\.\d+)?\s*(?:%\s+of|[+*/×÷-])\s*\d+(?:\.\d+)?\b"):
             selected.add("calculate")
 
         if matches(r"\b(self state|your state|token usage|token budget|usage budget|inspect_self)\b"):
             selected.update({"inspect_self_state", "get_workflow_state"})
         if matches(r"\b(workflow state|workflow status)\b"):
             selected.add("get_workflow_state")
+        if matches(r"\b(set workflow|advance workflow|workflow)\b"):
+            selected.add("set_workflow_state")
+        if matches(r"\b(update self state|remember your preference|operational state)\b"):
+            selected.add("update_self_state")
 
-        # Google tools: choose read/write subsets instead of loading the suite.
         if matches(r"\b(email|gmail|inbox|emails|mail)\b"):
             if matches(r"\b(search|find|look for|list|show|check|read|open)\b"):
                 selected.update({"gmail_list", "gmail_read"})
@@ -1231,8 +1313,9 @@ class SakuraAgent:
             selected.add("drive_list")
             if matches(r"\b(read|open|summari[sz]e|content|contents)\b"):
                 selected.add("docs_read")
+        if matches(r"\bconnect google|authorize google|connect gmail|connect calendar\b"):
+            selected.add("connect_google")
 
-        # GitHub: use intent-specific tools where possible.
         if matches(r"\b(github|repository|repo|pull request|\bpr\b|github issue)\b"):
             if matches(r"\b(create|open|file|report)\b.{0,30}\b(issue)\b"):
                 selected.add("github_create_issue")
@@ -1241,13 +1324,14 @@ class SakuraAgent:
             if matches(r"\b(repo|repository|repositories|github)\b"):
                 selected.add("github_list_repos")
 
-        # Reminders and monitoring.
         if matches(r"\b(remind me|set (a )?reminder|create (a )?reminder|alarm)\b"):
             selected.add("set_reminder")
         if matches(r"\b(list|show|my|check)\b.{0,30}\b(reminders?)\b"):
             selected.add("list_reminders")
         if matches(r"\b(delete|remove|cancel|edit|update)\b.{0,30}\b(reminders?)\b"):
             selected.update({"list_reminders", "delete_reminder", "edit_reminder"})
+        if matches(r"\b(acknowledge|mark.*handled|dismiss)\b.{0,40}\b(watch|alert|notification)\b"):
+            selected.add("acknowledge_watch_hit")
         if matches(r"\b(watch|monitor|track|alert me|notify me)\b"):
             if matches(r"\b(create|start|set up|monitor|track|watch)\b"):
                 selected.add("create_watch")
@@ -1256,7 +1340,6 @@ class SakuraAgent:
             if matches(r"\b(update|edit|delete|remove|stop)\b"):
                 selected.update({"list_watches", "update_watch", "delete_watch"})
 
-        # Maps/weather only for explicit location or forecast requests.
         if matches(r"\b(weather|forecast|temperature)\b"):
             selected.add("get_weather")
         if matches(r"\b(direction|directions|route|how do i get|navigate)\b"):
@@ -1265,29 +1348,73 @@ class SakuraAgent:
             selected.add("search_places")
         if matches(r"\b(map image|show (me )?a map|map of)\b"):
             selected.add("get_map_image")
+        if matches(r"\b(map link|location link|osm link)\b"):
+            selected.add("get_map_link")
 
-        # Telegram UI/media tools.
         if interaction_type == "callback":
             selected.update({"get_telegram_ui_context", "send_inline_keyboard", "edit_telegram_message"})
         elif matches(r"\b(create|add|show|edit|update|delete|remove|pin|unpin)\b.{0,35}\b(button|keyboard|menu|telegram message)\b"):
-            selected.update({"get_telegram_ui_context", "send_inline_keyboard", "edit_telegram_message", "delete_telegram_message"})
+            selected.update({"get_telegram_ui_context", "send_inline_keyboard", "edit_telegram_message", "delete_telegram_message", "pin_telegram_message", "unpin_telegram_message"})
         if matches(r"\b(analy[sz]e|describe|read)\b.{0,35}\b(image|photo|picture|document|pdf)\b"):
             if matches(r"\b(image|photo|picture)\b"):
                 selected.add("analyze_image")
             if matches(r"\b(document|pdf)\b"):
                 selected.add("analyze_document")
         if matches(r"\b(send|share)\b.{0,30}\b(image|photo|picture|file|document|media)\b"):
-            selected.add("send_telegram_media")
+            selected.update({"get_current_media_file_id", "send_telegram_media"})
+        if matches(r"\b(what file|file id|media id|reuse (this|the) (image|photo|file))\b"):
+            selected.add("get_current_media_file_id")
+        if matches(r"\b(telegram context|inspect telegram|what buttons|current buttons)\b"):
+            selected.add("inspect_telegram_context")
 
-        # Contextual follow-up: retain only the likely prior capability, not
-        # every tool mentioned anywhere in the conversation.
-        if prior:
-            prior_tools = self._select_tool_names_for_request(prior, history=None, interaction_type="message")
-            if not selected:
-                selected.update(prior_tools)
+        if matches(r"\b(pin)\b.{0,30}\b(message|this)\b"):
+            selected.add("pin_telegram_message")
+        if matches(r"\b(unpin)\b.{0,30}\b(message|this)\b"):
+            selected.add("unpin_telegram_message")
 
-        # Stable order makes logs/tests deterministic; ignore unregistered names.
+        if prior and not selected:
+            selected.update(self._regex_tool_names_for_request(prior, None, "message"))
+
         return [name for name in sorted(selected) if name in self.registry.functions]
+
+    async def _select_tool_names_for_request(
+        self,
+        user_text: str,
+        history: list[dict[str, str]] | None = None,
+        interaction_type: str = "message",
+    ) -> list[str]:
+        """Regex routing + optional semantic routing + a small always-on core."""
+        selected = set(self._regex_tool_names_for_request(user_text, history, interaction_type))
+
+        semantic_candidates = await self._semantic_tool_candidates(user_text, self.TOOL_ROUTER_TOP_K)
+        selected.update(name for name in semantic_candidates if name in self.registry.functions)
+
+        core = {
+            "current_time", "calculate", "web_search", "save_note", "search_notes",
+            "recent_notes", "set_reminder", "list_reminders", "get_weather",
+            "update_user_profile", "translate_text", "fetch_url",
+        }
+        selected.update(name for name in core if name in self.registry.functions)
+
+        # Avoid flooding the model with the whole registry: core + explicit
+        # intents + the best semantic matches, capped deterministically.
+        preferred = []
+        for name in self._regex_tool_names_for_request(user_text, history, interaction_type):
+            if name not in preferred:
+                preferred.append(name)
+        for name in semantic_candidates:
+            if name not in preferred:
+                preferred.append(name)
+        for name in sorted(core):
+            if name not in preferred:
+                preferred.append(name)
+        for name in sorted(selected):
+            if name not in preferred:
+                preferred.append(name)
+
+        # Keep a little more room for capability discovery while preventing a
+        # huge tools payload on every request.
+        return [name for name in preferred[: max(16, self.TOOL_ROUTER_TOP_K + 8)] if name in self.registry.functions]
 
     def _expand_tool_names_after_execution(
         self,
@@ -1303,9 +1430,10 @@ class SakuraAgent:
             "search_notes": ["update_note", "delete_note", "send_telegram_media"],
             "recent_notes": ["update_note", "delete_note"],
             "list_reminders": ["delete_reminder", "edit_reminder"],
-            "list_watches": ["update_watch", "delete_watch"],
+            "list_watches": ["update_watch", "delete_watch", "acknowledge_watch_hit"],
             "drive_list": ["docs_read"],
             "get_telegram_ui_context": ["edit_telegram_message", "delete_telegram_message"],
+            "get_current_media_file_id": ["send_telegram_media"],
         }
 
         for next_tool in staged_successors.get(executed_tool, []):
@@ -1463,6 +1591,7 @@ tell the user what's failing and ask how they'd like to proceed.
                 f"active={continuity['active_entity_type']}:{continuity.get('active_entity_id')}"
             )
         continuity_line = " | ".join(cont_parts) or "(none)"
+        summary_line = str(continuity.get("conversation_summary") or "").strip()[:5000] or "(none)"
 
         # Only the last two failures — everything older is noise.
         failures = (self_observation.get("recent_failures") or [])[-2:]
@@ -1494,6 +1623,7 @@ tell the user what's failing and ask how they'd like to proceed.
             + f"\n\nNOW: {now}"
             + f"\nTOOLS: {tool_names_line}"
             + f"\nCONTINUITY: {continuity_line}"
+            + f"\nCONVERSATION_SUMMARY: {summary_line}"
             + f"\nRECENT_TOOL_FAILURES: {failure_line}"
             + entities_line
             + f"\nPROFILE: {profile_line}"
@@ -1637,6 +1767,7 @@ tell the user what's failing and ask how they'd like to proceed.
         *,
         tools: list[dict[str, Any]] | None,
         phase: str = "agent",
+        max_completion_tokens: int | None = None,
     ):
         # ------------------------------------------------------------------
         # 1. Hard size check before touching the budget.
@@ -1687,9 +1818,13 @@ tell the user what's failing and ask how they'd like to proceed.
                 "model": self.MODEL_GROQ,
                 "temperature": 0.05 if tools else 0.2,
                 "top_p": 0.9,
-                # Tool-call turns never need long outputs. Capping here is the
-                # single biggest output-token saving for multi-round flows.
-                "max_completion_tokens": 350 if tools else 700,
+                # Keep tool-call rounds compact while giving final/no-tools
+                # synthesis enough room for a complete response.
+                "max_completion_tokens": (
+                    int(max_completion_tokens)
+                    if max_completion_tokens is not None
+                    else (350 if tools else 1400)
+                ),
                 "reasoning_effort": "low",
             }
 
@@ -1746,6 +1881,7 @@ tell the user what's failing and ask how they'd like to proceed.
                     # Success — reconcile the reservation with actual usage.
                     usage = getattr(response, "usage", None)
                     actual_tokens = getattr(usage, "total_tokens", None) if usage else None
+                    reservation_handled = False
                     try:
                         if actual_tokens is not None:
                             await self.self_state.reconcile_groq_reservation(
@@ -1756,17 +1892,19 @@ tell the user what's failing and ask how they'd like to proceed.
                             # Groq didn't report usage — release so the day's
                             # counter is not permanently reduced.
                             await self.self_state.release_groq_reservation(reserved)
+                        reservation_handled = True
                     except Exception:
                         self.log.warning(
-                            "Failed to reconcile Groq reservation "
+                            "Failed to reconcile/release Groq reservation "
                             "| reserved=%s actual=%s",
                             reserved,
                             actual_tokens,
                             exc_info=True,
                         )
-                    # Mark the reservation handled so the finally block does
-                    # not double-release it.
-                    reserved = 0
+                        # Keep the reservation non-zero so the outer finally
+                        # releases it instead of leaking the daily budget.
+                    if reservation_handled:
+                        reserved = 0
 
                     return response
 
@@ -2038,6 +2176,11 @@ tell the user what's failing and ask how they'd like to proceed.
             "list_watches": "watch_id",
             "drive_list": "document_id",
             "get_telegram_ui_context": "telegram_message_id",
+            "send_inline_keyboard": "telegram_message_id",
+            "edit_telegram_message": "telegram_message_id",
+            "delete_telegram_message": "telegram_message_id",
+            "pin_telegram_message": "telegram_message_id",
+            "unpin_telegram_message": "telegram_message_id",
         }
 
         def label_for(item: dict[str, Any]) -> str:
@@ -2058,7 +2201,17 @@ tell the user what's failing and ask how they'd like to proceed.
                     key_l = str(key).lower()
                     if isinstance(item, (str, int)):
                         if key_l in id_kind_by_key:
-                            direct_ids.append((id_kind_by_key[key_l], str(item)))
+                            kind = id_kind_by_key[key_l]
+                            if key_l == "message_id" and tool_name in {
+                                "get_telegram_ui_context",
+                                "send_inline_keyboard",
+                                "edit_telegram_message",
+                                "delete_telegram_message",
+                                "pin_telegram_message",
+                                "unpin_telegram_message",
+                            }:
+                                kind = "telegram_message_id"
+                            direct_ids.append((kind, str(item)))
                         elif key_l == "id":
                             kind = tool_specific.get(tool_name, "id")
                             direct_ids.append((kind, str(item)))
@@ -2192,8 +2345,165 @@ tell the user what's failing and ask how they'd like to proceed.
             return False
         data = payload.get("data")
         if isinstance(data, dict) and data.get("_suppress_final"):
-            return tool_name != "send_inline_keyboard" or self.request_context.interaction_type == "callback"
+            return True
         return False
+
+    async def _auto_extract_profile_facts(self, telegram_id: int, user_text: str) -> None:
+        """Capture obvious durable profile facts without another model call."""
+        text = (user_text or "").strip()
+        if not text:
+            return
+        updates: dict[str, str] = {}
+        patterns = [
+            ("name", r"\bmy name is\s+([A-Za-z][A-Za-z .'-]{1,60})[.!]?\s*$"),
+            # "call me" is deliberately stricter to avoid treating ordinary
+            # requests such as "call me later" / "call me in 5 minutes" as names.
+            (
+                "name",
+                r"\bcall me\s+(?!(?:back|later|tomorrow|today|please|when|if|in|at|on|after|before|around|about|soon|now)\b)"
+                r"([A-Za-z][A-Za-z.'-]{1,30}(?:\s+[A-Za-z][A-Za-z.'-]{1,30}){0,2})\s*[.!]?\s*$",
+            ),
+            ("location", r"\b(?:i live in|i'm from|i am from|my city is|i live at)\s+([^.!?]{2,100})[.!]?\s*$"),
+            ("timezone", r"\b(?:my timezone is|timezone is|use timezone)\s+([A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?)\b"),
+            ("education", r"\b(?:i study|i'm studying|i am studying|i major in)\s+([^.!?]{2,120})[.!]?\s*$"),
+            ("interests", r"\b(?:i like|i love|my interests are|i am interested in)\s+([^.!?]{2,160})[.!]?\s*$"),
+        ]
+        for field, pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                value = match.group(1).strip()
+                if value:
+                    updates[field] = value
+        dob = re.search(
+            r"\b(?:my birthday is|my date of birth is|i was born on)\s+(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b",
+            text,
+            re.IGNORECASE,
+        )
+        if dob:
+            updates["date_of_birth"] = dob.group(1).replace("/", "-")
+        if updates:
+            with contextlib.suppress(Exception):
+                await self.user_repo.update_profile(telegram_id, updates)
+
+    async def _gemini_summary_request(self, prompt: str) -> str:
+        """Run a no-tool Gemini summary so background memory work does not consume Groq budget."""
+        if self.gemini is None or genai_types is None:
+            return ""
+
+        contents = [
+            genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(text=prompt)],
+            )
+        ]
+        config = genai_types.GenerateContentConfig(
+            system_instruction=(
+                "Summarize conversation continuity only. "
+                "Keep durable facts, active tasks, decisions, preferences, and unresolved context. "
+                "Do not invent facts. Return only the compact summary."
+            ),
+            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        )
+
+        last_error: Exception | None = None
+        for model_name in self.GEMINI_MODELS:
+            try:
+                response = await self.gemini.aio.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+                summary = sanitize_answer((response.text or "").strip())
+                if summary:
+                    return summary
+            except Exception as exc:
+                last_error = exc
+                self.log.debug(
+                    "Conversation summary Gemini call failed | model=%s error=%s",
+                    model_name,
+                    _redact_log_text(str(exc)[:400]),
+                )
+
+        if last_error is not None:
+            self.log.debug(
+                "Conversation summary skipped after Gemini failures | error=%s",
+                _redact_log_text(str(last_error)[:400]),
+            )
+        return ""
+
+    async def _maybe_update_conversation_summary(self, telegram_id: int) -> None:
+        """Periodically compress older turns using Gemini, never Groq."""
+        try:
+            # Preserve the free-tier Groq budget: background summaries are best-effort
+            # and are skipped when Gemini is not configured.
+            if self.gemini is None:
+                return
+
+            recent = await self.conversations.recent(telegram_id, limit=30)
+            state = await self.continuity.get(telegram_id)
+            if len(recent) <= self.CONVERSATION_SUMMARY_THRESHOLD:
+                return
+
+            last_count = int(state.get("conversation_summary_message_count") or 0)
+            # Summaries are only useful after a meaningful amount of new conversation.
+            if last_count and len(recent) - last_count < 8:
+                return
+
+            existing = str(state.get("conversation_summary") or "").strip()
+            older = list(reversed(recent))[:-self.RECENT_HISTORY_MESSAGES]
+            transcript = "\n".join(
+                f"{item.get('role', 'user')}: {str(item.get('content') or '')[:700]}"
+                for item in older[-18:]
+                if item.get("content")
+            )
+            if not transcript:
+                return
+
+            profile = await self.user_repo.get_profile(telegram_id)
+            prompt = (
+                "Create a compact continuity summary for a personal assistant. "
+                "Keep only durable facts, active tasks, decisions, preferences, and unresolved context. "
+                "Do not invent facts. Output about 120-220 words.\n\n"
+                f"Existing summary:\n{existing[:1800]}\n\n"
+                f"Profile facts:\n{json.dumps(profile, ensure_ascii=False, default=str)[:2200]}\n\n"
+                f"Older conversation:\n{transcript[:9000]}"
+            )
+
+            summary = await self._gemini_summary_request(prompt)
+            if summary:
+                with contextlib.suppress(Exception):
+                    await self.continuity.set_summary(
+                        telegram_id,
+                        summary,
+                        message_count=len(recent),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.log.debug(
+                "Conversation summary update skipped: %s",
+                _redact_log_text(str(exc)[:300]),
+            )
+
+    def _schedule_conversation_summary(self, telegram_id: int) -> None:
+        """Start at most one background summary task per user and keep it strongly referenced."""
+        existing = self._summary_tasks.get(telegram_id)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(self._maybe_update_conversation_summary(telegram_id))
+        self._summary_tasks[telegram_id] = task
+
+        def _cleanup(done: asyncio.Task, user_id: int = telegram_id) -> None:
+            current = self._summary_tasks.get(user_id)
+            if current is done:
+                self._summary_tasks.pop(user_id, None)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                done.result()
+
+        task.add_done_callback(_cleanup)
 
     async def respond(
         self,
@@ -2222,6 +2532,8 @@ tell the user what's failing and ask how they'd like to proceed.
 
         try:
             await self.conversations.add(telegram_id, "user", user_text)
+            await self._auto_extract_profile_facts(telegram_id, user_text)
+            self._schedule_conversation_summary(telegram_id)
 
             # Fetch and compact history once — no repeated slicing.
             recent = await self.conversations.recent(telegram_id, limit=8)
@@ -2255,7 +2567,7 @@ tell the user what's failing and ask how they'd like to proceed.
                     str(continuity["active_entity_id"]),
                 )
 
-            active_tool_names = self._select_tool_names_for_request(
+            active_tool_names = await self._select_tool_names_for_request(
                 user_text,
                 prior_history,
                 interaction_type=ctx.interaction_type,
@@ -2514,7 +2826,28 @@ tell the user what's failing and ask how they'd like to proceed.
                     )
                     return answer
 
-            answer = "🌸 I stopped the tool loop after reaching the safety limit."
+            if executed_calls:
+                try:
+                    final_response = await self._groq_request(
+                        messages,
+                        tools=None,
+                        phase="tool_loop_finalizer",
+                        max_completion_tokens=1400,
+                    )
+                    answer = sanitize_answer(
+                        getattr(final_response.choices[0].message, "content", "") or ""
+                    )
+                    if answer:
+                        await self.conversations.add(telegram_id, "assistant", answer)
+                        return answer
+                except Exception as exc:
+                    self.log.warning(
+                        "Tool-loop finalizer failed | request_id=%s error=%s",
+                        ctx.request_id,
+                        _redact_log_text(str(exc)[:700]),
+                    )
+
+            answer = "🌸 I completed the available actions, but couldn't compose the final response right now."
             await self.conversations.add(
                 telegram_id,
                 "assistant",

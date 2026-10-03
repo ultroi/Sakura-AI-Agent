@@ -145,7 +145,17 @@ class Scheduler:
             return
         if self.application.job_queue.get_jobs_by_name("daily-digest"):
             return
-        hour, minute = 8, 0
+        try:
+            hour, minute = (int(part) for part in self.agent.settings.digest_time.split(":", 1))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid DIGEST_TIME=%r; falling back to 08:00.",
+                self.agent.settings.digest_time,
+            )
+            hour, minute = 8, 0
+
         self.application.job_queue.run_daily(
             self._daily_digest_callback,
             time=time(hour=hour, minute=minute, tzinfo=self.tz),
