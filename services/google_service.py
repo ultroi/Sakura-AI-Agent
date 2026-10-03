@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from email.message import EmailMessage
 import base64
 from datetime import datetime, timezone, timedelta
@@ -50,58 +51,108 @@ class GoogleService:
         return self._services[key]
 
     def _creds(self) -> Credentials:
-        # 1. Force the file path to be the actual filename from settings
-        token_file = Path(self.settings.google_token_file)
-        
-        # Safety Check: If someone accidentally put JSON in the .env variable, reset it
-        if "{" in self.settings.google_token_file or len(self.settings.google_token_file) > 20:
-            token_file = Path("token.json")
-            
-        creds = None
-        
-        # If the file exists, try to load it
-        if token_file.exists():
-            try:
-                creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
-            except Exception as e:
-                print(f"Warning: Corrupted token.json file. Deleting it. Error: {e}")
-                token_file.unlink() # Delete bad file
-                creds = None
-            
-            # CRITICAL FIX for scope changes: 
-            if creds and set(creds.scopes) != set(SCOPES):
-                print("Scopes have changed! Forcing re-authentication...")
-                creds = None 
+        """
+        Load Google OAuth credentials and user token.
 
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
+        StackHost:
+          GOOGLE_CREDENTIALS_FILE = complete OAuth client JSON
+          GOOGLE_TOKEN_FILE        = complete authorized-user token JSON
+
+        Local development can still use file paths and run the browser flow.
+        """
+        credentials_value = self.settings.google_credentials_file.strip()
+        token_value = self.settings.google_token_file.strip()
+
+        credentials_json = None
+        token_json = None
+
+        # Environment values may contain JSON directly or a path to a JSON file.
+        if credentials_value.startswith("{"):
+            try:
+                credentials_json = json.loads(credentials_value)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "GOOGLE_CREDENTIALS_FILE contains invalid JSON."
+                ) from exc
+            credentials_path = None
+        else:
+            credentials_path = Path(credentials_value)
+
+        if token_value.startswith("{"):
+            try:
+                token_json = json.loads(token_value)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "GOOGLE_TOKEN_FILE contains invalid JSON."
+                ) from exc
+            token_path = None
+        else:
+            token_path = Path(token_value)
+
+        creds = None
+
+        # Prefer the token supplied directly through the environment.
+        if token_json is not None:
+            try:
+                creds = Credentials.from_authorized_user_info(
+                    token_json, scopes=SCOPES
+                )
+            except (ValueError, TypeError, KeyError) as exc:
+                raise RuntimeError(
+                    "GOOGLE_TOKEN_FILE is not a valid Google authorized-user token."
+                ) from exc
+        elif token_path and token_path.is_file():
+            try:
+                creds = Credentials.from_authorized_user_file(
+                    str(token_path), SCOPES
+                )
+            except (ValueError, TypeError, KeyError) as exc:
+                raise RuntimeError(
+                    f"Could not read Google token file: {token_path}"
+                ) from exc
+
+        if creds and not creds.valid:
+            if creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request(timeout=20))
-                except Exception:
-                    # If refresh fails, wipe it out and start over
-                    creds = None
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Google token refresh failed. Reauthorize locally and "
+                        "update GOOGLE_TOKEN_FILE with the new token JSON."
+                    ) from exc
+            else:
+                creds = None
 
-            if not creds:
-                # --- NEW FIX FOR CREDENTIALS JSON ---
-                credentials_file = Path(self.settings.google_credentials_file)
-                
-                # Safety Check for credentials.json too!
-                if "{" in self.settings.google_credentials_file or len(self.settings.google_credentials_file) > 50:
-                    credentials_file = Path("credentials.json")
-                
-                if not credentials_file.exists():
-                    raise FileNotFoundError(
-                        f"Google OAuth credentials not found: {credentials_file}. "
-                        "Make sure 'credentials.json' is in your project folder!"
-                    )
-                
-                # Run local server to get the new credentials
-                flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
-                creds = flow.run_local_server(port=0)
-                
-            # Save the new token with all 4 scopes!
-            token_file.write_text(creds.to_json(), encoding="utf-8")
-            
+        if creds and creds.valid:
+            # Persist refreshed tokens only when using a local token file.
+            if token_json is None and token_path is not None:
+                token_path.write_text(creds.to_json(), encoding="utf-8")
+            return creds
+
+        # If JSON was supplied through StackHost environment variables, do not
+        # attempt to launch a browser in the headless deployment container.
+        if credentials_json is not None or token_json is not None:
+            raise RuntimeError(
+                "Google authorization token is missing or invalid. "
+                "Generate token.json locally using the same SCOPES, then paste "
+                "its complete JSON into GOOGLE_TOKEN_FILE on StackHost."
+            )
+
+        if not credentials_path or not credentials_path.is_file():
+            raise FileNotFoundError(
+                f"Google OAuth credentials not found: {credentials_path}. "
+                "Set GOOGLE_CREDENTIALS_FILE to a JSON file path or its JSON content."
+            )
+
+        # Local-only interactive authorization flow.
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(credentials_path), SCOPES
+        )
+        creds = flow.run_local_server(port=0)
+
+        if token_path is not None:
+            token_path.write_text(creds.to_json(), encoding="utf-8")
+
         return creds
 
     # --- GMAIL & CALENDAR (Existing) ---
