@@ -1,22 +1,24 @@
+```yaml
 user:
   name: Akshay
   github: ultroi
 
 runtime:
   name: python
-  version: 3.11
+  version: "3.11"
   image: python:3.11-slim
 
 commands:
   package: ""
   build:
-    - pip install -r requirements.txt
+    - pip install --no-cache-dir -r requirements.txt
     - python -m compileall -q .
   start: "python app.py"
 
 repository:
   branch: main
-  auto_deploy: True
+  auto_deploy: true
 
 env:
   - BOT_TOKEN:BOT_TOKEN
+```
