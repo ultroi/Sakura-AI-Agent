@@ -467,39 +467,28 @@ class SakuraAgent:
     # Default model label. Kept as a string for code that references it.
     MODEL_GROQ = "openai/gpt-oss-120b"
 
-    # Rotation set. Each model on Groq has its own free-tier quota bucket,
-    # so a 429 on one does not mean the others are exhausted.
     GROQ_MODELS = (
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "llama-3.3-70b-versatile",
-        "qwen/qwen3-32b",
+        "qwen/qwen3.8-27b",
     )
-    # Subset that reliably emits valid tool calls. Used when a tool surface
-    # is attached to the request.
+
     GROQ_TOOL_CAPABLE = (
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "llama-3.3-70b-versatile",
-        "qwen/qwen3-32b",
+        "qwen/qwen3.8-27b",
     )
-    # Cheap models for translation, classification, and other one-shot work.
+
     GROQ_LITE_MODELS = (
-        "meta-llama/llama-4-scout-17b-16e-instruct",
         "openai/gpt-oss-20b",
-        "llama-3.3-70b-versatile",
+        "qwen/qwen3.8-27b",
     )
 
     GEMINI_MODELS = (
-        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview",
         "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash-8b",
+        "gemini-2.5-flash-lite",
     )
     MODEL_GEMINI = GEMINI_MODELS[0]
 
