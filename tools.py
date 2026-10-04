@@ -102,12 +102,56 @@ def _safe_eval(node, state=None):
     raise ValueError("Unsupported mathematical expression.")
 
 
-def calculate(expression: str) -> str:
+_SUPERSCRIPT_DIGITS = str.maketrans(
+    {
+        "⁰": "0",
+        "¹": "1",
+        "²": "2",
+        "³": "3",
+        "⁴": "4",
+        "⁵": "5",
+        "⁶": "6",
+        "⁷": "7",
+        "⁸": "8",
+        "⁹": "9",
+        "⁻": "-",
+    }
+)
+
+
+def _normalize_math_expression(expression: str) -> str:
     expression = (expression or "").strip()
+    expression = expression.replace(",", "")
+    expression = expression.replace("×", "*").replace("÷", "/")
+    expression = expression.replace("−", "-").replace("–", "-")
+    expression = expression.replace("π", "pi")
+    expression = expression.replace("^", "**")
+
+    # Convert common superscript powers such as 999² and 10⁴ into Python AST syntax.
+    expression = re.sub(
+        r"(\d+(?:\.\d+)?)\s*(⁻?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)",
+        lambda m: f"{m.group(1)}**{m.group(2).translate(_SUPERSCRIPT_DIGITS)}",
+        expression,
+    )
+
+    # Convert natural-language percentage expressions such as 15% of 2480.
+    expression = re.sub(
+        r"(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)",
+        r"(\1/100*\2)",
+        expression,
+        flags=re.IGNORECASE,
+    )
+    return expression
+
+
+def calculate(expression: str) -> str:
+    expression = _normalize_math_expression(expression)
     if not expression or len(expression) > 500:
         raise ValueError("Expression must be 1-500 characters long.")
     tree = ast.parse(expression, mode="eval")
     result = _safe_eval(tree, {"nodes": 0})
+    if isinstance(result, float) and result.is_integer():
+        return str(int(result))
     return str(result)
 
 
@@ -241,18 +285,36 @@ def register_tools(agent):
     # -----------------------------------------------------------------------
     @r.register(
         "calculate",
-        "Evaluate a math expression. Use this instead of computing in your head.",
+        "Evaluate explicit mathematical expressions, arithmetic, percentages, equations, powers, and numerical calculations.",
         {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]},
     )
     async def _calculate(expression: str):
         try:
-            return await asyncio.to_thread(calculate, expression)
+            result = await asyncio.to_thread(calculate, expression)
+            try:
+                numeric = float(result)
+                if math.isfinite(numeric) and numeric.is_integer():
+                    formatted = str(int(numeric))
+                else:
+                    formatted = result
+            except Exception:
+                formatted = result
+            return json.dumps(
+                {
+                    "expression": expression,
+                    "result": result,
+                    "formatted_result": formatted,
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:
-            raise ToolExecutionError(f"Calculation error: {exc}. Please adjust your expression and try again.")
+            raise ToolExecutionError(
+                f"Calculation error: {exc}. Please adjust your expression and try again."
+            )
 
     @r.register(
         "current_time",
-        "Get the current date and time in the user's local timezone.",
+        "Get the current local date/time, current time, today's date, or current day for the user.",
         {"type": "object", "properties": {}, "additionalProperties": False},
     )
     async def _current_time():
@@ -260,7 +322,7 @@ def register_tools(agent):
 
     @r.register(
         "web_search",
-        "Search the public web via Tavily for current facts or recent news.",
+        "Search the public web for current or recent information, latest news, prices, releases, versions, status, or facts not available from private tools.",
         {
             "type": "object",
             "properties": {
@@ -313,7 +375,7 @@ def register_tools(agent):
 
     @r.register(
         "get_weather",
-        "Get current weather and today's forecast for a city (Open-Meteo).",
+        "Get current weather, temperature, forecast, rain, humidity, or other weather conditions for a city using Open-Meteo.",
         {"type": "object", "properties": {"city": {"type": ["string", "null"]}}, "required": []},
     )
     async def _weather(city: str | None = None):
@@ -355,7 +417,7 @@ def register_tools(agent):
 
     @r.register(
         "fetch_url",
-        "Fetch a public HTTP/HTTPS URL and extract readable text.",
+        "Open/read/fetch a public URL or webpage supplied by the user and extract its readable text.",
         {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
     )
     async def _fetch_url(url: str):
@@ -376,7 +438,7 @@ def register_tools(agent):
     # -----------------------------------------------------------------------
     @r.register(
         "gmail_list",
-        "List recent Gmail messages. Use this first to obtain real message_ids.",
+        "List or search recent/latest Gmail emails and messages from the inbox. Use this first to obtain real message_ids.",
         {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 20}}, "required": []},
     )
     async def _gmail_list(query: str = "", max_results: int = 3):
@@ -388,7 +450,7 @@ def register_tools(agent):
 
     @r.register(
         "gmail_read",
-        "Read a Gmail message by message_id (obtain it from gmail_list first).",
+        "Open/read a Gmail email or message by message_id (obtain it from gmail_list first).",
         {"type": "object", "properties": {"message_id": {"type": "string"}}, "required": ["message_id"]},
     )
     async def _gmail_read(message_id: str):
@@ -770,7 +832,7 @@ def register_tools(agent):
 
     @r.register(
         "search_places",
-        "Search for places via OpenStreetMap Nominatim.",
+        "Find nearby places and points of interest such as restaurants, cafes, hotels, shops, or other places via OpenStreetMap. Supports requests like 'near me', 'nearby', or 'find a cafe in X'.",
         {
             "type": "object",
             "properties": {
@@ -845,7 +907,7 @@ def register_tools(agent):
     # -----------------------------------------------------------------------
     @r.register(
         "save_note",
-        "Save a note by title. Reusing the same title updates the existing note.",
+        "Save or update a user note/memory. Use when the user asks to remember, save, store, or keep information as a note.",
         {"type": "object", "properties": {"title": {"type": "string"}, "content": {"type": "string"}}, "required": ["title", "content"]},
         side_effect=True,
     )
@@ -855,25 +917,36 @@ def register_tools(agent):
 
     @r.register(
         "search_notes",
-        "Search notes/memories (hybrid keyword + semantic).",
+        "Retrieve existing saved notes/memories by meaning or keywords. "
+        "If query is empty, falls back to listing recent notes. Use when the user "
+        "asks for saved notes, remembered information, or \"what did I save about X?\".",
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "minLength": 1, "maxLength": 500},
+                "query": {"type": "string", "maxLength": 500},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20},
             },
-            "required": ["query"],
+            "required": [],
             "additionalProperties": False,
         },
     )
-    async def _search_notes(query: str, limit: int = 10):
-        docs = await agent.notes.hybrid_search(
-            agent.telegram_id,
-            query,
-            limit=max(1, min(limit, 20)),
-        )
+    async def _search_notes(query: str = "", limit: int = 10):
+        query = (query or "").strip()
+        if query:
+            docs = await agent.notes.hybrid_search(
+                agent.telegram_id,
+                query,
+                limit=max(1, min(limit, 20)),
+            )
+        else:
+            docs = await agent.notes.recent(
+                agent.telegram_id,
+                max(1, min(limit, 20)),
+            )
         if not docs:
-            return f"No matching notes or memories found for '{query}'."
+            if query:
+                return f"No matching notes or memories found for '{query}'."
+            return "No notes saved yet."
         return json.dumps(
             [
                 {
@@ -888,7 +961,7 @@ def register_tools(agent):
 
     @r.register(
         "recent_notes",
-        "List recently saved notes.",
+        "List recent saved notes/memories. Use for requests like \"show my notes\", \"give my notes\", or \"recent notes\".",
         {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 20}}, "required": []},
     )
     async def _recent_notes(limit: int = 10):
@@ -1020,11 +1093,48 @@ def register_tools(agent):
 
     @r.register(
         "delete_reminder",
-        "Cancel a pending reminder (reminder_id from list_reminders).",
-        {"type": "object", "properties": {"reminder_id": {"type": "string"}}, "required": ["reminder_id"]},
+        "Cancel one pending Telegram reminder. The reminder_id must come from list_reminders. "
+        "Requires explicit confirmation before deletion.",
+        {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "string"},
+                "confirm": {"type": "boolean"},
+            },
+            "required": ["reminder_id"],
+            "additionalProperties": False,
+        },
         side_effect=True,
     )
-    async def _delete_reminder(reminder_id: str):
+    async def _delete_reminder(reminder_id: str, confirm: bool = False):
+        if not confirm:
+            docs = await agent.reminders.get_user_pending(agent.telegram_id)
+            target = next(
+                (d for d in docs if str(d.get("_id")) == str(reminder_id)),
+                None,
+            )
+            if target is None:
+                raise ToolExecutionError(
+                    "Failed to cancel: invalid reminder ID or reminder already sent."
+                )
+            await agent.continuity.set(
+                agent.telegram_id,
+                topic="reminder",
+                intent="delete_reminder_confirmation_required",
+                active_entity_type="reminder",
+                active_entity_id=str(reminder_id),
+                pending_confirmation={
+                    "action": "delete_reminder",
+                    "reminder_id": str(reminder_id),
+                    "text": str(target.get("text") or ""),
+                    "run_at": str(target.get("run_at") or ""),
+                },
+            )
+            raise ToolExecutionError(
+                "CONFIRMATION_REQUIRED: This will permanently cancel the pending "
+                f"reminder '{target.get('text') or 'Reminder'}'. Ask the user to confirm."
+            )
+
         success = await agent.reminders.delete(reminder_id, agent.telegram_id)
 
         if success:
@@ -1037,7 +1147,8 @@ def register_tools(agent):
                     pass
             return "Successfully canceled the reminder."
 
-        raise ToolExecutionError("Failed to cancel: Invalid ID or reminder already sent.")
+        raise ToolExecutionError("Failed to cancel: invalid ID or reminder already sent.")
+
 
     @r.register(
         "edit_reminder",
@@ -1129,7 +1240,7 @@ def register_tools(agent):
     # -----------------------------------------------------------------------
     @r.register(
         "create_watch",
-        "Persistent background monitor (anime / product / website). Not a fixed-time reminder — use set_reminder for that.",
+        "Create a persistent background monitor/watch for an anime, product, or website. Use when the user asks to create/start/set up a monitor or keep checking for a condition. Not a fixed-time reminder — use set_reminder for that.",
         {
             "type": "object",
             "properties": {
@@ -1228,7 +1339,7 @@ def register_tools(agent):
 
     @r.register(
         "list_watches",
-        "List the user's persistent background watches.",
+        "List the user's current persistent background monitors/watches, including target, condition, status, interval, and next check. Use for requests like \"show my monitors\", \"list watches\", or \"what am I monitoring?\".",
         {"type": "object", "properties": {}, "additionalProperties": False},
     )
     async def _list_watches():
@@ -1280,7 +1391,7 @@ def register_tools(agent):
 
     @r.register(
         "update_watch",
-        "Update a watch's interval or condition/query/url (watch_id from list_watches).",
+        "Update an existing persistent monitor/watch: change its interval, condition, query, or URL. The watch_id must come from list_watches. Use for requests like \"change the monitor to daily\" or \"update this watch\".",
         {
             "type": "object",
             "properties": {
@@ -1344,11 +1455,50 @@ def register_tools(agent):
 
     @r.register(
         "delete_watch",
-        "Delete a watch (watch_id from list_watches).",
-        {"type": "object", "properties": {"watch_id": {"type": "string"}}, "required": ["watch_id"], "additionalProperties": False},
+        "Permanently delete/stop one persistent background monitor/watch. The watch_id must come from list_watches. "
+        "Use for requests such as 'delete this monitor', 'stop this watch', or 'remove that monitor'. "
+        "Requires explicit confirmation.",
+        {
+            "type": "object",
+            "properties": {
+                "watch_id": {"type": "string"},
+                "confirm": {"type": "boolean"},
+            },
+            "required": ["watch_id"],
+            "additionalProperties": False,
+        },
         side_effect=True,
     )
-    async def _delete_watch(watch_id: str):
+    async def _delete_watch(watch_id: str, confirm: bool = False):
+        docs = await agent.watches.list_user(agent.telegram_id)
+        target = next(
+            (d for d in docs if str(d.get("_id")) == str(watch_id)),
+            None,
+        )
+        if target is None:
+            raise ToolExecutionError(
+                "Failed to stop: invalid watch ID or watch not found."
+            )
+
+        if not confirm:
+            await agent.continuity.set(
+                agent.telegram_id,
+                topic="watch",
+                intent="delete_watch_confirmation_required",
+                active_entity_type="watch",
+                active_entity_id=str(watch_id),
+                pending_confirmation={
+                    "action": "delete_watch",
+                    "watch_id": str(watch_id),
+                    "target": str(target.get("target") or ""),
+                    "condition": str(target.get("condition") or ""),
+                },
+            )
+            raise ToolExecutionError(
+                "CONFIRMATION_REQUIRED: This will permanently delete the "
+                f"monitor '{target.get('target') or 'Unnamed monitor'}'. Ask the user to confirm."
+            )
+
         success = await agent.watches.delete(watch_id, agent.telegram_id)
         if success:
             await agent.continuity.set(
@@ -1358,8 +1508,93 @@ def register_tools(agent):
                 clear_active_entity=True,
             )
         if not success:
-            raise ToolExecutionError("Failed to stop: invalid watch ID or watch not found.")
+            raise ToolExecutionError(
+                "Failed to stop: invalid watch ID or watch not found."
+            )
         return "Successfully stopped the watch."
+
+    @r.register(
+        "delete_all_watches",
+        "Permanently delete every active persistent monitor/watch belonging to the user. "
+        "Use when the user asks to delete, remove, terminate, or stop all/current monitors. "
+        "Requires explicit confirmation. This is a bulk action and is safer than making the "
+        "LLM repeat one delete_watch call at a time.",
+        {
+            "type": "object",
+            "properties": {
+                "confirm": {"type": "boolean"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        side_effect=True,
+        timeout=30,
+    )
+    async def _delete_all_watches(confirm: bool = False):
+        docs = await agent.watches.list_user(agent.telegram_id)
+        active = [
+            d for d in docs
+            if bool(d.get("enabled", True))
+        ]
+
+        if not active:
+            return json.dumps(
+                {"deleted": 0, "failed": 0, "status": "nothing_to_delete"},
+                ensure_ascii=False,
+            )
+
+        if not confirm:
+            preview = [
+                {
+                    "watch_id": str(d.get("_id")),
+                    "target": d.get("target"),
+                    "condition": d.get("condition"),
+                }
+                for d in active[:20]
+            ]
+            await agent.continuity.set(
+                agent.telegram_id,
+                topic="watch",
+                intent="delete_all_watches_confirmation_required",
+                pending_confirmation={
+                    "action": "delete_all_watches",
+                    "count": len(active),
+                    "items": preview,
+                },
+            )
+            raise ToolExecutionError(
+                "CONFIRMATION_REQUIRED: This will permanently delete "
+                f"all {len(active)} active monitor(s). Ask the user to confirm."
+            )
+
+        deleted = 0
+        failed = 0
+        for item in active:
+            watch_id = str(item.get("_id"))
+            try:
+                if await agent.watches.delete(watch_id, agent.telegram_id):
+                    deleted += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+
+        await agent.continuity.set(
+            agent.telegram_id,
+            topic="watch",
+            intent="delete_all_watches",
+            clear_active_entity=True,
+        )
+        return json.dumps(
+            {
+                "status": "completed",
+                "deleted": deleted,
+                "failed": failed,
+                "requested": len(active),
+            },
+            ensure_ascii=False,
+        )
+
 
     @r.register(
         "acknowledge_watch_hit",
@@ -1383,7 +1618,7 @@ def register_tools(agent):
     # -----------------------------------------------------------------------
     @r.register(
         "send_telegram_media",
-        "Send a stored photo/video/document/voice by file_id.",
+        "Send an existing Telegram photo, video, document, or voice file into the current chat. Use when the user explicitly asks to send/share/re-send media.",
         {
             "type": "object",
             "properties": {
@@ -1425,7 +1660,7 @@ def register_tools(agent):
 
     @r.register(
         "analyze_image",
-        "Analyze the image on the current or replied-to message.",
+        "Analyze, describe, inspect, or read text from an image/photo attached to the current or replied-to Telegram message.",
         {
             "type": "object",
             "properties": {
@@ -1476,7 +1711,7 @@ def register_tools(agent):
 
     @r.register(
         "analyze_document",
-        "Read/analyze the document on the current or replied-to message.",
+        "Read, analyze, summarize, or extract text from a document/PDF attached to the current or replied-to Telegram message.",
         {
             "type": "object",
             "properties": {

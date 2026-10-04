@@ -53,12 +53,55 @@ try:
     from sentence_transformers import SentenceTransformer
 except Exception:  # Optional on low-memory/free-tier deployments.
     SentenceTransformer = None
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+except Exception:  # Optional zero-API fallback for semantic candidate retrieval.
+    TfidfVectorizer = None
 from services.google_service import GoogleService
 from services.github_service import GitHubService
 from utils.logger import setup_logger
 
 
 ToolFunc = Callable[..., Awaitable[Any]]
+
+# Precompiled patterns (compiled once at import instead of on every call).
+_RE_CODE_FENCE = re.compile(r"```[\s\S]*?```")
+_RE_PRESENTATION_TAG = re.compile(
+    r"</?(?:b|strong|i|em|u|s|strike|del|code|pre|a|blockquote|tg-spoiler|br)\b[^<>]*?/?>",
+    re.IGNORECASE,
+)
+_RE_PARAGRAPH_SPLIT = re.compile(r"(\n\s*\n)")
+_RE_INLINE_BULLET = re.compile(r"\s+\u2022\s+")
+_RE_3PLUS_NL = re.compile(r"\n{4,}")
+_RE_TRAILING_WS = re.compile(r"[ \t]+\n")
+_RE_AFFIRMATIVE = re.compile(
+    r"\s*(?:yes|yeah|yep|yup|sure|okay|ok|confirm|confirmed|do it|go ahead|proceed)\s*[.!]?\s*",
+    re.IGNORECASE,
+)
+_RE_WATCH_TERMS = re.compile(r"[a-z0-9]+")
+_RE_WS = re.compile(r"\s+")
+_RE_WATCH_UPDATED = re.compile(r"\b(?:updated?|last updated)\s*[:\-]?\s*[^.]{0,80}")
+_RE_WATCH_CLOCK = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
+_RE_WATCH_ISO_DATE = re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b")
+_RE_WATCH_COUNTERS = re.compile(r"\b(?:\d[\d,]*\+?\s*(?:views?|viewers?|online|likes?))\b")
+_RE_ANIME_ANNOUNCE = re.compile(
+    r"\b(?:new season|season\s*[2-9]|season\s*(?:two|three|four|five)|"
+    r"officially announced|official announcement|renewed|renewal|sequel announced|"
+    r"production announced|production confirmed|new sequel)\b",
+    re.I,
+)
+_RE_UNAVAILABLE = re.compile(
+    r"\b(?:out of stock|sold out|currently unavailable|unavailable|not available|temporarily unavailable)\b"
+)
+_RE_AVAILABLE = re.compile(r"\b(?:in stock|available now|add to cart|add to bag|buy now|order now)\b")
+_RE_STOCK_HIT = re.compile(r"\b(?:in stock|available now|available|back in stock|restocked)\b", re.I)
+_WATCHER_STOPWORDS = frozenset({
+    "the", "a", "an", "for", "when", "whenever", "new", "officially", "official",
+    "announced", "announcement", "season", "product", "available", "availability",
+    "tell", "me", "let", "know", "and", "is", "are", "this", "that", "page",
+    "website", "watch", "monitor", "track", "please", "now",
+})
 
 
 def normalize_rich_markdown(text: str) -> str:
@@ -68,7 +111,7 @@ def normalize_rich_markdown(text: str) -> str:
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\\n", "\n")
-    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    text = _RE_3PLUS_NL.sub("\n\n\n", text)
 
     fenced: list[str] = []
 
@@ -76,41 +119,32 @@ def normalize_rich_markdown(text: str) -> str:
         fenced.append(match.group(0))
         return f"\n@@__SAKURA_CODE_{len(fenced)-1}__@@\n"
 
-    text = re.sub(r"```[\s\S]*?```", stash_code, text)
+    text = _RE_CODE_FENCE.sub(stash_code, text)
 
-    def clean_tag(match: re.Match[str]) -> str:
-        # Sakura's model contract is Markdown-only. Strip HTML tags here so a
-        # model/tool result can never inject arbitrary Telegram HTML into the
-        # final renderer. Fenced code was stashed above and is restored later.
-        return ""
+    # Sakura's model contract is Markdown-only: strip presentation HTML tags so
+    # model/tool output can never inject Telegram HTML. Plain text such as
+    # `a < b > c` and `<3` is preserved.
+    text = _RE_PRESENTATION_TAG.sub("", text)
 
-    # Only strip known presentation tags. This preserves ordinary text such as
-    # `a < b > c` and `<3`.
-    text = re.sub(
-        r"</?(?:b|strong|i|em|u|s|strike|del|code|pre|a|blockquote|tg-spoiler|br)\b[^<>]*?/?>",
-        clean_tag,
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    paragraphs = re.split(r"(\n\s*\n)", text)
+    paragraphs = _RE_PARAGRAPH_SPLIT.split(text)
     repaired: list[str] = []
     for part in paragraphs:
         if part == "\n\n" or not part.strip():
             repaired.append(part)
             continue
-        if len(re.findall(r"\s+•\s+", part)) >= 2 and "@@__SAKURA_CODE_" not in part:
-            part = re.sub(r"\s+•\s+", "\n- ", part)
+        if len(_RE_INLINE_BULLET.findall(part)) >= 2 and "@@__SAKURA_CODE_" not in part:
+            part = _RE_INLINE_BULLET.sub("\n- ", part)
         repaired.append(part)
 
     text = "".join(repaired)
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{4,}", "\n\n\n", text).strip()
+    text = _RE_TRAILING_WS.sub("\n", text)
+    text = _RE_3PLUS_NL.sub("\n\n\n", text).strip()
 
-    for i, block in enumerate(fenced):
-        text = text.replace(
-            f"@@__SAKURA_CODE_{i}__@@",
-            block.strip("\n"),
+    if fenced:
+        text = re.sub(
+            r"@@__SAKURA_CODE_(\d+)__@@",
+            lambda m: fenced[int(m.group(1))].strip("\n"),
+            text,
         )
     return text
 
@@ -120,12 +154,7 @@ def rich_markdown_to_plain(text: str) -> str:
         return ""
     text = re.sub(r"```(?:[A-Za-z0-9_+.-]+)?\n?", "", text)
     text = text.replace("```", "")
-    text = re.sub(
-        r"</?(?:b|strong|i|em|u|s|strike|del|code|pre|a|blockquote|tg-spoiler|br)\b[^<>]*?/?>",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
+    text = _RE_PRESENTATION_TAG.sub("", text)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*\d+[.)]\s+", "• ", text, flags=re.MULTILINE)
@@ -273,6 +302,18 @@ class ToolSpec:
     timeout: float = 45.0
     side_effect: bool = False
 
+    def router_text(self) -> str:
+        properties = self.parameters.get("properties") or {}
+        required = self.parameters.get("required") or []
+        parameter_names = ", ".join(str(name) for name in properties)
+        required_names = ", ".join(str(name) for name in required)
+        effect = "SIDE EFFECT" if self.side_effect else "READ-ONLY"
+        return (
+            f"{self.name.replace('_', ' ')}. {self.description} "
+            f"Parameters: {parameter_names or 'none'}. "
+            f"Required: {required_names or 'none'}. {effect}."
+        )
+
 
 def _coerce_tool_data(value: Any) -> Any:
     """Keep tool results JSON-shaped whenever a tool already returned JSON."""
@@ -333,6 +374,23 @@ class ToolRegistry:
             for schema in self.schemas
             if schema["function"]["name"] in allowed
         ]
+
+    def router_catalog(self, names: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
+        allowed = set(names) if names is not None else set(self.functions)
+        rows = []
+        for name, spec in self.functions.items():
+            if name not in allowed:
+                continue
+            rows.append(
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "side_effect": bool(spec.side_effect),
+                    "parameters": list((spec.parameters.get("properties") or {}).keys()),
+                    "required": list(spec.parameters.get("required") or []),
+                }
+            )
+        return rows
 
     def validate_arguments(self, name: str, arguments: dict[str, Any]) -> None:
         spec = self.functions.get(name)
@@ -406,26 +464,90 @@ class ProviderFailure(RuntimeError):
 
 
 class SakuraAgent:
+    # Default model label. Kept as a string for code that references it.
     MODEL_GROQ = "openai/gpt-oss-120b"
-    GEMINI_MODELS = ("gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.7-flash")
+
+    # Rotation set. Each model on Groq has its own free-tier quota bucket,
+    # so a 429 on one does not mean the others are exhausted.
+    GROQ_MODELS = (
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+    )
+    # Subset that reliably emits valid tool calls. Used when a tool surface
+    # is attached to the request.
+    GROQ_TOOL_CAPABLE = (
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+    )
+    # Cheap models for translation, classification, and other one-shot work.
+    GROQ_LITE_MODELS = (
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "openai/gpt-oss-20b",
+        "llama-3.3-70b-versatile",
+    )
+
+    GEMINI_MODELS = (
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-8b",
+    )
     MODEL_GEMINI = GEMINI_MODELS[0]
 
-    # ------------------------------------------------------------------
-    # Token / context budget (tuned for the Groq free tier).
-    # ------------------------------------------------------------------
-    GROQ_DAILY_TOKEN_BUDGET = 180_000  
-    GROQ_BUDGET_SAFETY_MARGIN = 0.05    
-
-    MAX_TOOL_ROUNDS = 3
-    MAX_TOOL_RESULT_CHARS = 2_500
-    MAX_HISTORY_CHARS = 4_000
-    MAX_REQUEST_CHARS = 40_000
-    RECENT_HISTORY_MESSAGES = 6
-    CONVERSATION_SUMMARY_THRESHOLD = 12
+    # Tunables referenced throughout the class. These were previously used but
+    # never defined (AttributeError at runtime). Values are conservative
+    # defaults sized for free-tier quotas: adjust to your deployment.
+    MAX_TOOL_ROUNDS = 4
+    MAX_TOOL_RESULT_CHARS = 6000
+    MAX_HISTORY_CHARS = 6000
+    MAX_REQUEST_CHARS = 60000
+    RECENT_HISTORY_MESSAGES = 8
+    CONVERSATION_SUMMARY_THRESHOLD = 20
     TOOL_ROUTER_TOP_K = 8
-
-    WATCH_NOTIFICATION_COOLDOWN_MINUTES = 360
+    GROQ_DAILY_TOKEN_BUDGET = 500_000
+    GROQ_BUDGET_SAFETY_MARGIN = 10_000
+    WATCH_NOTIFICATION_COOLDOWN_MINUTES = 180
     WATCH_FAILURE_ALERT_THRESHOLD = 3
+
+    # Static lookup tables hoisted out of per-call code paths.
+    _MSG_ID_TOOLS = frozenset({
+        "edit_telegram_message", "delete_telegram_message",
+        "pin_telegram_message", "unpin_telegram_message",
+    })
+    _TOOL_PREREQUISITES = {
+        "gmail_read": (("message_id", "message_id"),),
+        "gmail_send_attachment": (("message_id", "message_id"), ("attachment_id", "attachment_id")),
+        "docs_read": (("document_id", "document_id"),),
+        "update_note": (("note_id", "note_id"),),
+        "delete_note": (("note_id", "note_id"),),
+        "delete_reminder": (("reminder_id", "reminder_id"),),
+        "edit_reminder": (("reminder_id", "reminder_id"),),
+        "update_watch": (("watch_id", "watch_id"),),
+        "delete_watch": (("watch_id", "watch_id"),),
+        "send_telegram_media": (("file_id", "file_id"),),
+    }
+    _LOOKUP_FOR_TOOL = {
+        "delete_note": "search_notes",
+        "update_note": "search_notes",
+        "delete_reminder": "list_reminders",
+        "edit_reminder": "list_reminders",
+        "delete_watch": "list_watches",
+        "update_watch": "list_watches",
+        "acknowledge_watch_hit": "list_watches",
+        "gmail_read": "gmail_list",
+        "gmail_send_attachment": "gmail_read",
+        "docs_read": "drive_list",
+        "send_telegram_media": "get_current_media_file_id",
+    }
 
     def __init__(self, settings: Settings, db):
         self.settings = settings
@@ -483,7 +605,7 @@ class SakuraAgent:
 
         self._llm_gate = asyncio.Semaphore(2)
         self._tool_gate = asyncio.Semaphore(4)
-        self._groq_cooldown_until = 0.0
+        self._groq_cooldown_until: dict[str, float] = {}
         self._request_context: contextvars.ContextVar[RequestContext | None] = (
             contextvars.ContextVar("sakura_request_context", default=None)
         )
@@ -495,11 +617,15 @@ class SakuraAgent:
         # also prevents multiple concurrent summary calls for the same user.
         self._summary_tasks: dict[int, asyncio.Task] = {}
 
-        # Semantic router is lazy and opt-in; this keeps free/low-memory
-        # deployments from loading a transformer unless explicitly enabled.
+        # Tool routing uses semantic candidate retrieval plus an LLM arbiter only
+        # for ambiguous or side-effect requests. No regex is used to decide tools.
         self._tool_router_model = None
         self._tool_router_embeddings = None
+        self._tool_router_vectorizer = None
+        self._tool_router_tfidf = None
         self._tool_router_names: list[str] = []
+        self._tool_router_texts: list[str] = []
+        self._tool_router_backend: str | None = None
         self._tool_router_lock = asyncio.Lock()
 
         self._static_system_prompt = self._build_static_system_prompt()
@@ -584,21 +710,14 @@ class SakuraAgent:
 
     @staticmethod
     def _watcher_terms(text: str) -> list[str]:
-        stop = {
-            "the", "a", "an", "for", "when", "whenever", "new", "officially", "official",
-            "announced", "announcement", "season", "product", "available", "availability",
-            "tell", "me", "let", "know", "and", "is", "are", "this", "that", "page",
-            "website", "watch", "monitor", "track", "please", "now",
-        }
-        return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if (len(w) >= 3 or w.isdigit()) and w not in stop][:12]
+        return [
+            w for w in _RE_WATCH_TERMS.findall(text.lower())
+            if (len(w) >= 3 or w.isdigit()) and w not in _WATCHER_STOPWORDS
+        ][:12]
 
     @staticmethod
     def _is_affirmative(text: str) -> bool:
-        return bool(re.fullmatch(
-            r"\s*(?:yes|yeah|yep|yup|sure|okay|ok|confirm|confirmed|do it|go ahead|proceed)\s*[.!]?\s*",
-            text or "",
-            flags=re.I,
-        ))
+        return _RE_AFFIRMATIVE.fullmatch(text or "") is not None
 
     async def _handle_pending_confirmation(
         self,
@@ -610,9 +729,24 @@ class SakuraAgent:
 
         action = str(pending.get("action") or "")
         args: dict[str, Any]
+
         if action == "delete_note":
-            note_id = str(pending.get("note_id") or "")
-            args = {"note_id": note_id, "confirm": True}
+            args = {
+                "note_id": str(pending.get("note_id") or ""),
+                "confirm": True,
+            }
+        elif action == "delete_reminder":
+            args = {
+                "reminder_id": str(pending.get("reminder_id") or ""),
+                "confirm": True,
+            }
+        elif action == "delete_watch":
+            args = {
+                "watch_id": str(pending.get("watch_id") or ""),
+                "confirm": True,
+            }
+        elif action == "delete_all_watches":
+            args = {"confirm": True}
         elif action == "gmail_send":
             args = {
                 "to": str(pending.get("to") or ""),
@@ -628,18 +762,170 @@ class SakuraAgent:
         if self._tool_result_ok(result):
             with contextlib.suppress(Exception):
                 await self.continuity.clear_confirmation(self.telegram_id)
-            try:
-                payload = json.loads(result)
-                data = payload.get("data")
-                if isinstance(data, str):
-                    return data
-                return json.dumps(data, ensure_ascii=False, default=str)
-            except Exception:
-                return result
+            return self._deterministic_tool_fallback(
+                [{"tool": action, "args": args, "result": result}]
+            )
+
         return (
             "🌸 I received the confirmation, but the action still failed. "
             "I did not claim it succeeded."
         )
+
+    def _deterministic_tool_fallback(
+        self,
+        executed_calls: list[dict[str, Any]],
+    ) -> str:
+        """Produce a truthful user-facing response without another LLM call."""
+        successful = [
+            call
+            for call in executed_calls
+            if self._tool_result_ok(str(call.get("result") or ""))
+        ]
+        if not successful:
+            return (
+                "🌸 I couldn't complete that action because the available tool "
+                "did not return a successful result."
+            )
+
+        def unwrap(result: str) -> Any:
+            try:
+                payload = json.loads(result)
+            except Exception:
+                return result
+            if not isinstance(payload, dict):
+                return payload
+            data = payload.get("data")
+            if isinstance(data, str):
+                stripped = data.strip()
+                if stripped.startswith(("[", "{")):
+                    try:
+                        return json.loads(stripped)
+                    except Exception:
+                        pass
+            return data if "data" in payload else payload
+
+        last = successful[-1]
+        tool_name = str(last.get("tool") or "")
+        data = unwrap(str(last.get("result") or ""))
+
+        if tool_name == "calculate":
+            if isinstance(data, dict):
+                value = data.get("result", data.get("formatted_result"))
+                if value is not None:
+                    return f"Result: {value}"
+            return f"Result: {data}"
+
+        if tool_name in {"current_time", "translate_text"}:
+            return str(data).strip()
+
+        if tool_name == "save_note":
+            return f"Saved successfully. {str(data).strip()}"
+
+        if tool_name in {"search_notes", "recent_notes"}:
+            rows = data if isinstance(data, list) else []
+            if not rows:
+                return str(data).strip() or "No matching notes found."
+            chunks = []
+            for row in rows[:10]:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title") or "Untitled note").strip()
+                content = str(row.get("content") or "").strip()
+                chunks.append(f"**{title}**\n{content}")
+            return "Here are your notes:\n\n" + "\n\n".join(chunks)
+
+        if tool_name == "list_watches":
+            rows = data if isinstance(data, list) else []
+            if not rows:
+                return "You have no active or saved monitors."
+            chunks = []
+            for index, row in enumerate(rows, 1):
+                if not isinstance(row, dict):
+                    continue
+                target = str(row.get("target") or "Unnamed").strip()
+                condition = str(row.get("condition") or "").strip()
+                interval = row.get("interval_minutes")
+                status = "active" if row.get("enabled", True) else "disabled"
+                line = f"{index}. **{target}** — {status}"
+                if condition:
+                    line += f"\n   Condition: {condition}"
+                if interval is not None:
+                    line += f"\n   Checks every: {interval} min"
+                if row.get("next_check"):
+                    line += f"\n   Next check: {row['next_check']}"
+                chunks.append(line)
+            return "Current monitors:\n\n" + "\n\n".join(chunks)
+
+        if tool_name == "delete_watch":
+            return "The monitor was deleted successfully."
+
+        if tool_name == "delete_all_watches":
+            if isinstance(data, dict):
+                deleted = int(data.get("deleted") or 0)
+                failed = int(data.get("failed") or 0)
+                if failed:
+                    return f"Deleted {deleted} monitor(s). {failed} monitor(s) could not be deleted."
+                return f"Deleted {deleted} monitor(s) successfully."
+            return "All requested monitors were deleted successfully."
+
+        if tool_name == "list_reminders":
+            rows = data if isinstance(data, list) else []
+            if not rows:
+                return "You have no pending reminders."
+            chunks = [
+                f"{i}. **{row.get('text', 'Reminder')}** — {row.get('run_at', 'time unavailable')}"
+                for i, row in enumerate(rows, 1)
+                if isinstance(row, dict)
+            ]
+            return "Pending reminders:\n\n" + "\n".join(chunks)
+
+        if tool_name in {"delete_reminder", "edit_reminder", "update_note"}:
+            return str(data).strip() or "The requested change was completed successfully."
+
+        if tool_name == "web_search":
+            rows = data.get("results") if isinstance(data, dict) else None
+            if isinstance(rows, list) and rows:
+                chunks = []
+                for row in rows[:5]:
+                    if not isinstance(row, dict):
+                        continue
+                    title = str(row.get("title") or "Result").strip()
+                    url = str(row.get("url") or "").strip()
+                    if url:
+                        chunks.append(f"- [{title}]({url})")
+                    else:
+                        chunks.append(f"- {title}")
+                return "I found:\n" + "\n".join(chunks)
+            return "I didn't find any matching results."
+
+        if tool_name == "get_weather" and isinstance(data, dict):
+            current = data.get("current") or {}
+            location = data.get("location") or "your location"
+            temp = current.get("temperature_2m")
+            feels = current.get("apparent_temperature")
+            if temp is not None:
+                answer = f"Current weather for **{location}**: {temp}°C"
+                if feels is not None:
+                    answer += f" (feels like {feels}°C)."
+                return answer
+
+        if isinstance(data, str):
+            return data.strip() or "Completed successfully."
+
+        if isinstance(data, dict):
+            # Keep the fallback readable without dumping internal envelopes.
+            visible = {
+                key: value
+                for key, value in data.items()
+                if not str(key).startswith("_")
+            }
+            if visible:
+                return "Completed successfully:\n" + "\n".join(
+                    f"- **{key.replace('_', ' ').title()}:** {value}"
+                    for key, value in visible.items()
+                )
+
+        return "The requested action completed successfully."
 
     async def _resolve_public_ip(self, url: str) -> tuple[str, str, int, str]:
         parsed = urlparse(url)
@@ -824,12 +1110,10 @@ class SakuraAgent:
 
     @staticmethod
     def _normalize_watch_content(text: str) -> str:
-        normalized = re.sub(r"\s+", " ", text or "").strip().lower()
-        normalized = re.sub(r"\b(?:updated?|last updated)\s*[:\-]?\s*[^.]{0,80}", " ", normalized)
-        normalized = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", normalized)
-        normalized = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b", " ", normalized)
-        normalized = re.sub(r"\b(?:\d[\d,]*\+?\s*(?:views?|viewers?|online|likes?))\b", " ", normalized)
-        return re.sub(r"\s+", " ", normalized).strip()[:8000]
+        normalized = _RE_WS.sub(" ", text or "").strip().lower()
+        for pattern in (_RE_WATCH_UPDATED, _RE_WATCH_CLOCK, _RE_WATCH_ISO_DATE, _RE_WATCH_COUNTERS):
+            normalized = pattern.sub(" ", normalized)
+        return _RE_WS.sub(" ", normalized).strip()[:8000]
 
     async def _check_watch(self, watch: dict[str, Any]) -> tuple[bool, str, list[str], Any]:
         kind = str(watch.get("kind") or "website")
@@ -843,12 +1127,7 @@ class SakuraAgent:
         if kind == "anime":
             search_query = query or f"{target} {condition} official announcement"
             results = await self._watcher_search(search_query)
-            announcement_terms = re.compile(
-                r"\b(?:new season|season\s*[2-9]|season\s*(?:two|three|four|five)|"
-                r"officially announced|official announcement|renewed|renewal|sequel announced|"
-                r"production announced|production confirmed|new sequel)\b",
-                re.I,
-            )
+            announcement_terms = _RE_ANIME_ANNOUNCE
             target_terms = self._watcher_terms(target)
             candidates: list[dict[str, str]] = []
             for result in results:
@@ -873,14 +1152,8 @@ class SakuraAgent:
             if url:
                 text, final_url = await self._watcher_fetch_page(url)
                 low = text.lower()
-                unavailable = re.search(
-                    r"\b(?:out of stock|sold out|currently unavailable|unavailable|not available|temporarily unavailable)\b",
-                    low,
-                )
-                available = re.search(
-                    r"\b(?:in stock|available now|add to cart|add to bag|buy now|order now)\b",
-                    low,
-                )
+                unavailable = _RE_UNAVAILABLE.search(low)
+                available = _RE_AVAILABLE.search(low)
                 state = "unavailable" if unavailable and not available else ("available" if available else "unknown")
                 changed = bool(state != "unknown" and state != last_state and last_state is not None)
                 if last_state is None:
@@ -894,7 +1167,7 @@ class SakuraAgent:
 
             search_query = query or f"{target} in stock available"
             results = await self._watcher_search(search_query)
-            available_terms = re.compile(r"\b(?:in stock|available now|available|back in stock|restocked)\b", re.I)
+            available_terms = _RE_STOCK_HIT
             hits = [r for r in results if available_terms.search(f"{r['title']} {r['snippet']}")]
             new = [r for r in hits if r["url"] and r["url"] not in seen]
             if not seen:
@@ -1095,19 +1368,48 @@ class SakuraAgent:
         msg = self.current_message
         query = self.request_context.callback_query
         parts = [f"interaction_type={self.request_context.interaction_type}"]
+
         if query is not None:
             parts.append(f"callback_data={str(getattr(query, 'data', '') or '')[:500]}")
+
         if msg is not None:
             markup = getattr(msg, "reply_markup", None)
             is_interactive = self.request_context.interaction_type == "callback" or bool(
                 getattr(markup, "inline_keyboard", None)
             )
+
+            media_kinds = []
+            if getattr(msg, "photo", None):
+                media_kinds.append("photo/image")
+            if getattr(msg, "document", None):
+                media_kinds.append("document")
+            if getattr(msg, "video", None):
+                media_kinds.append("video")
+            if getattr(msg, "voice", None):
+                media_kinds.append("voice")
+
+            reply = getattr(msg, "reply_to_message", None)
+            if reply is not None:
+                if getattr(reply, "photo", None):
+                    media_kinds.append("replied-photo/image")
+                if getattr(reply, "document", None):
+                    media_kinds.append("replied-document")
+                if getattr(reply, "video", None):
+                    media_kinds.append("replied-video")
+
             parts.append(f"current_message_id={getattr(msg, 'message_id', None)}")
-            parts.append(f"current_chat_id={getattr(getattr(msg, 'chat', None), 'id', self.chat_id)}")
+            parts.append(
+                f"current_chat_id={getattr(getattr(msg, 'chat', None), 'id', self.chat_id)}"
+            )
             parts.append(f"current_message_is_interactive={is_interactive}")
+
+            if media_kinds:
+                parts.append("current_media=" + ", ".join(dict.fromkeys(media_kinds)))
+
             msg_text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
             if msg_text:
                 parts.append(f"current_message_text={msg_text[:1200]}")
+
             buttons: list[str] = []
             if markup is not None:
                 for row in getattr(markup, "inline_keyboard", []) or []:
@@ -1120,7 +1422,9 @@ class SakuraAgent:
                             buttons.append(label)
             if buttons:
                 parts.append("current_buttons=" + " | ".join(buttons[:30]))
+
         return "\n".join(parts)
+
 
     def _history_for_request(self, history: list[dict[str, Any]]) -> list[dict[str, str]]:
         compact: list[dict[str, str]] = []
@@ -1149,233 +1453,327 @@ class SakuraAgent:
     def _topic_for_tools(tool_names: list[str]) -> str:
         if not tool_names:
             return "conversation"
-        name = tool_names[0]
-        mapping = {
-            "create_watch": "watch",
-            "list_watches": "watch",
-            "update_watch": "watch",
-            "delete_watch": "watch",
-            "acknowledge_watch_hit": "watch",
-            "search_notes": "memory",
-            "recent_notes": "memory",
-            "save_note": "memory",
-            "update_note": "memory",
-            "delete_note": "memory",
-            "gmail_list": "gmail",
-            "gmail_read": "gmail",
-            "gmail_send": "gmail",
-            "calendar_list": "calendar",
-            "calendar_create": "calendar",
-            "get_telegram_ui_context": "telegram_ui",
-            "send_inline_keyboard": "telegram_ui",
-            "edit_telegram_message": "telegram_ui",
-            "delete_telegram_message": "telegram_ui",
-            "set_workflow_state": "workflow",
-            "get_workflow_state": "workflow",
-            "inspect_self_state": "self_state",
-            "update_self_state": "self_state",
-        }
-        return mapping.get(name, name.rsplit("_", 1)[0])
+        return tool_names[0].split("_", 1)[0] or tool_names[0]
+    
 
     def _tool_router_text(self, name: str) -> str:
         spec = self.registry.functions.get(name)
         if not spec:
             return name.replace("_", " ")
-        return f"{name.replace('_', ' ')}. {spec.description}"
+        return spec.router_text()
 
-    async def _ensure_tool_router_embeddings(self) -> bool:
-        """Lazily load sentence-transformers when explicitly enabled."""
-        if os.getenv("SAKURA_TOOL_ROUTER", "off").strip().lower() not in {"1", "true", "yes", "embedding"}:
+    async def _ensure_tool_router_index(self) -> bool:
+        """Build a local semantic index over all registered tools.
+
+        The index never decides the action itself. It only retrieves a small
+        candidate set so the main LLM receives a tiny, relevant tool surface.
+        No regex-based intent detection is used here.
+        """
+        backend = os.getenv("SAKURA_TOOL_ROUTER", "tfidf").strip().lower()
+
+        if backend in {"off", "disabled", "false", "0"}:
             return False
-        if SentenceTransformer is None:
-            return False
+
         async with self._tool_router_lock:
-            if self._tool_router_model is not None and self._tool_router_embeddings is not None:
+            if self._tool_router_names and self._tool_router_backend:
                 return True
-            try:
-                names = sorted(self.registry.functions)
-                texts = [self._tool_router_text(name) for name in names]
 
-                def _load():
-                    model = SentenceTransformer(
-                        os.getenv("SAKURA_TOOL_ROUTER_MODEL", "all-MiniLM-L6-v2")
+            names = sorted(self.registry.functions)
+            texts = [self._tool_router_text(name) for name in names]
+
+            # Explicit sentence-transformer mode when the deployment already
+            # includes it. TF-IDF is the zero-API, low-memory default.
+            if backend in {"embedding", "sentence-transformers", "semantic"}:
+                if SentenceTransformer is not None:
+                    try:
+                        model = SentenceTransformer(
+                            os.getenv(
+                                "SAKURA_TOOL_ROUTER_MODEL",
+                                "all-MiniLM-L6-v2",
+                            )
+                        )
+
+                        def _encode():
+                            return model.encode(
+                                texts,
+                                normalize_embeddings=True,
+                            )
+
+                        embeddings = await asyncio.to_thread(_encode)
+                        self._tool_router_model = model
+                        self._tool_router_embeddings = embeddings
+                        self._tool_router_vectorizer = None
+                        self._tool_router_tfidf = None
+                        self._tool_router_names = names
+                        self._tool_router_texts = texts
+                        self._tool_router_backend = "embedding"
+                        return True
+                    except Exception as exc:
+                        self.log.warning(
+                            "Sentence-transformer tool router unavailable; "
+                            "falling back to TF-IDF | error=%s",
+                            _redact_log_text(str(exc)[:500]),
+                        )
+
+            if TfidfVectorizer is not None:
+                try:
+                    vectorizer = TfidfVectorizer(
+                        lowercase=True,
+                        ngram_range=(1, 2),
+                        sublinear_tf=True,
+                        min_df=1,
                     )
-                    embeddings = model.encode(texts, normalize_embeddings=True)
-                    return model, embeddings
+                    matrix = vectorizer.fit_transform(texts)
+                    self._tool_router_model = None
+                    self._tool_router_embeddings = None
+                    self._tool_router_vectorizer = vectorizer
+                    self._tool_router_tfidf = matrix
+                    self._tool_router_names = names
+                    self._tool_router_texts = texts
+                    self._tool_router_backend = "tfidf"
+                    return True
+                except Exception as exc:
+                    self.log.warning(
+                        "TF-IDF tool router unavailable | error=%s",
+                        _redact_log_text(str(exc)[:500]),
+                    )
 
-                model, embeddings = await asyncio.to_thread(_load)
-                self._tool_router_model = model
-                self._tool_router_embeddings = embeddings
-                self._tool_router_names = names
-                return True
-            except Exception as exc:
-                self.log.warning("Semantic tool router unavailable: %s", _redact_log_text(str(exc)[:500]))
-                self._tool_router_model = None
-                self._tool_router_embeddings = None
-                self._tool_router_names = []
-                return False
+            # Last local fallback: stdlib-only lexical retrieval. This still
+            # avoids intent regexes and external model calls.
+            self._tool_router_model = None
+            self._tool_router_embeddings = None
+            self._tool_router_vectorizer = None
+            self._tool_router_tfidf = None
+            self._tool_router_names = names
+            self._tool_router_texts = texts
+            self._tool_router_backend = "stdlib"
+            return bool(names)
 
-    async def _semantic_tool_candidates(self, user_text: str, top_k: int) -> list[str]:
-        ready = await self._ensure_tool_router_embeddings()
+    @staticmethod
+    def _routing_query(
+        user_text: str,
+        history: list[dict[str, str]] | None,
+        interaction_context: str,   # accepted for signature compat; not used
+    ) -> str:
+        recent: list[str] = []
+        for item in (history or [])[-3:]:
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "").strip()
+            if content:
+                recent.append(f"{role}: {content[:400]}")
+
+        current = str(user_text or "").strip()
+        return ((current + "\n") * 5 + "\n".join(recent)).strip()
+
+    async def _semantic_tool_candidates(
+        self,
+        user_text: str,
+        history: list[dict[str, str]] | None = None,
+        interaction_type: str = "message",
+        top_k: int | None = None,
+    ) -> list[tuple[str, float]]:
+        ready = await self._ensure_tool_router_index()
         if not ready:
             return []
+
+        top_k = top_k or self.TOOL_ROUTER_TOP_K
+        query = self._routing_query(
+            user_text,
+            history,
+            self.telegram_interaction_context(),
+        )
+
         try:
-            query_vec = await asyncio.to_thread(
-                self._tool_router_model.encode,
-                [user_text],
-                normalize_embeddings=True,
-            )
-            scores = (self._tool_router_embeddings @ query_vec[0]).tolist()
+            if self._tool_router_backend == "embedding":
+                query_vec = await asyncio.to_thread(
+                    self._tool_router_model.encode,
+                    [query],
+                    normalize_embeddings=True,
+                )
+                scores = (
+                    self._tool_router_embeddings @ query_vec[0]
+                ).tolist()
+            elif self._tool_router_backend == "tfidf":
+                query_vec = self._tool_router_vectorizer.transform([query])
+                scores = self._tool_router_tfidf.dot(query_vec.T).toarray().ravel().tolist()
+            else:
+                # Small, dependency-free fallback. This is retrieval only; the
+                # actual decision remains with the main LLM.
+                query_terms = set(
+                    token.casefold()
+                    for token in query.replace("\n", " ").split()
+                    if len(token) >= 3
+                )
+                scores = []
+                for text in self._tool_router_texts:
+                    terms = set(
+                        token.casefold()
+                        for token in text.replace("\n", " ").split()
+                        if len(token) >= 3
+                    )
+                    overlap = len(query_terms & terms)
+                    scores.append(
+                        overlap / max(1, min(len(query_terms), len(terms)))
+                    )
+
             ranked = sorted(
                 zip(self._tool_router_names, scores),
                 key=lambda pair: pair[1],
                 reverse=True,
             )
-            return [name for name, score in ranked[:top_k] if score >= 0.28]
-        except Exception:
+            # A tiny floor prevents ordinary conceptual conversation from
+            # exposing arbitrary zero-score tools.
+            return [
+                (name, float(score))
+                for name, score in ranked[: max(1, top_k)]
+                if float(score) >= 0.03
+            ]
+        except Exception as exc:
+            self.log.warning(
+                "Tool candidate retrieval failed | error=%s",
+                _redact_log_text(str(exc)[:500]),
+            )
             return []
 
-    def _regex_tool_names_for_request(
+    @staticmethod
+    def _parse_router_json(text: str) -> list[str]:
+        if not text:
+            return []
+
+        raw = str(text).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("` \n")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].lstrip()
+
+        candidates: list[Any] = []
+        for payload in (raw,):
+            try:
+                candidates.append(json.loads(payload))
+            except Exception:
+                pass
+
+        if not candidates:
+            # Recover from a response containing surrounding prose.
+            for opener, closer in (("{", "}"), ("[", "]")):
+                left = raw.find(opener)
+                right = raw.rfind(closer)
+                if left >= 0 and right > left:
+                    try:
+                        candidates.append(json.loads(raw[left : right + 1]))
+                        break
+                    except Exception:
+                        continue
+
+        if not candidates:
+            return []
+
+        payload = candidates[0]
+        if isinstance(payload, dict):
+            value = payload.get("tools")
+        else:
+            value = payload
+
+        if not isinstance(value, list):
+            return []
+
+        return [
+            str(name).strip()
+            for name in value
+            if isinstance(name, str) and name.strip()
+        ]
+
+    async def _llm_route_candidates(
         self,
         user_text: str,
-        history: list[dict[str, str]] | None = None,
-        interaction_type: str = "message",
+        history: list[dict[str, str]],
+        candidates: list[tuple[str, float]],
+        interaction_type: str,
     ) -> list[str]:
-        text = (user_text or "").strip().lower()
-        selected: set[str] = set()
+        if not candidates:
+            return []
 
-        def matches(*patterns: str) -> bool:
-            return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+        candidate_names = [name for name, _score in candidates]
+        catalog = self.registry.router_catalog(candidate_names)
 
-        contextual = len(text.split()) <= 8 and matches(
-            r"\b(it|that|those|same|there|do this|do that|go ahead)\b"
+        routing_context = self._routing_query(
+            user_text,
+            history,
+            self.telegram_interaction_context(),
         )
-        prior = ""
-        if contextual and history:
-            prior = next(
-                (str(item.get("content") or "").lower() for item in reversed(history) if item.get("role") == "user"),
-                "",
-            )
 
-        if matches(r"\b(what time is it|current time|time right now|what is the time)\b",
-                   r"\b(today'?s date|what date is it|current date|what day is (it|today))\b",
-                   r"\b(how many days until|days left until|what time will it be)\b"):
-            selected.add("current_time")
+        router_system = """
+You are Sakura's internal tool router. You DO NOT execute tools.
+Your only job is to choose the smallest set of tools that actually helps
+fulfil the user's current request.
 
-        if matches(r"\b(save|remember|store|keep|write down|make)\b.{0,45}\b(note|this|that|it)\b",
-                   r"\b(note this|save this|remember this|keep this in mind)\b"):
-            selected.add("save_note")
-        if matches(r"\b(find|search|show|list|read|retrieve|recall)\b.{0,50}\b(my )?(notes?|memos?)\b",
-                   r"\b(what did i (save|note|write down|ask you to remember))\b"):
-            selected.update({"search_notes", "recent_notes"})
-        if matches(r"\b(update|edit|change)\b.{0,40}\b(note|memory)\b"):
-            selected.add("update_note")
-        if matches(r"\b(delete|remove)\b.{0,40}\b(note|memory)\b"):
-            selected.add("delete_note")
-        if matches(r"\b(my name is|i am called|call me|i live in|i am from|my birthday|my date of birth|i study|i am studying|my timezone|remember (that )?i)\b"):
-            selected.add("update_user_profile")
+Rules:
+- Choose only from the supplied CANDIDATE TOOLS.
+- Ordinary conversation, explanations, opinions, greetings, and conceptual
+  questions normally require zero tools.
+- The current request is authoritative. Recent context is only for resolving
+  references such as "it", "that", "them", or "again".
+- Never choose a tool merely because a word overlaps. Judge the user's intent.
+- Prefer the most specific tool over a broader one.
+- For dependent operations, include the prerequisite lookup tool too:
+  gmail_list -> gmail_read,
+  search_notes/recent_notes -> update_note/delete_note,
+  list_reminders -> edit_reminder/delete_reminder,
+  list_watches -> update_watch/delete_watch,
+  drive_list -> docs_read,
+  get_current_media_file_id -> send_telegram_media.
+- For destructive actions, choose the destructive tool only when the user is
+  actually requesting that action. Confirmation is handled by the executor.
+- For a bulk watch deletion request, prefer delete_all_watches when present.
+- Return ONLY JSON in this exact shape:
+  {"tools":["tool_name_1","tool_name_2"]}
+No markdown. No explanation.
+""".strip()
 
-        if matches(r"\b(search (the )?(web|internet|online)|look (it )?up online|google (for|this))\b",
-                   r"\b(latest|current|today'?s|recent|breaking)\b.{0,50}\b(news|price|release|version|update|weather|result|status)\b",
-                   r"\b(news|price|release|version|update|weather|result|status)\b.{0,50}\b(latest|current|today|recent|right now)\b"):
-            selected.add("web_search")
-        if matches(r"https?://\S+", r"\b(open|fetch|read|load)\b.{0,30}\b(url|link|website|page)\b"):
-            selected.add("fetch_url")
-        if matches(r"\b(translate|translation)\b"):
-            selected.add("translate_text")
-        if matches(r"\b(calculate|compute|work out|evaluate|solve (this|the equation|for x))\b",
-                   r"\b(what is|how much is)\s+[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%\s+of|[+*/×÷-])\s*[-+]?\d",
-                   r"\b\d+(?:\.\d+)?\s*(?:%\s+of|[+*/×÷-])\s*\d+(?:\.\d+)?\b"):
-            selected.add("calculate")
+        user_payload = (
+            f"CANDIDATE TOOLS:\n"
+            f"{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            f"INTERACTION TYPE: {interaction_type}\n"
+            f"REQUEST AND CONTEXT:\n{routing_context}"
+        )
 
-        if matches(r"\b(self state|your state|token usage|token budget|usage budget|inspect_self)\b"):
-            selected.update({"inspect_self_state", "get_workflow_state"})
-        if matches(r"\b(workflow state|workflow status)\b"):
-            selected.add("get_workflow_state")
-        if matches(r"\b(set workflow|advance workflow|workflow)\b"):
-            selected.add("set_workflow_state")
-        if matches(r"\b(update self state|remember your preference|operational state)\b"):
-            selected.add("update_self_state")
+        # another Groq quota unit on normal tool requests.
+        if self.gemini is not None and genai_types is not None:
+            for model_name in self.GEMINI_MODELS[:3]:
+                config = genai_types.GenerateContentConfig(
+                    system_instruction=router_system,
+                    response_mime_type="application/json",
+                    automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    ),
+                )
 
-        if matches(r"\b(email|gmail|inbox|emails|mail)\b"):
-            if matches(r"\b(search|find|look for|list|show|check|read|open)\b"):
-                selected.update({"gmail_list", "gmail_read"})
-            if matches(r"\b(send|reply|forward|compose|draft)\b"):
-                selected.update({"gmail_send", "gmail_send_attachment"})
-            if not (selected & {"gmail_list", "gmail_read", "gmail_send", "gmail_send_attachment"}):
-                selected.update({"gmail_list", "gmail_read"})
-        if matches(r"\b(calendar|meeting|event|schedule)\b"):
-            if matches(r"\b(create|add|schedule|book|move|update|reschedule)\b"):
-                selected.add("calendar_create")
-            if matches(r"\b(list|show|check|find|what|when|view)\b") or "calendar_create" not in selected:
-                selected.add("calendar_list")
-        if matches(r"\b(google drive|drive files|my files|google docs|document in drive)\b"):
-            selected.add("drive_list")
-            if matches(r"\b(read|open|summari[sz]e|content|contents)\b"):
-                selected.add("docs_read")
-        if matches(r"\bconnect google|authorize google|connect gmail|connect calendar\b"):
-            selected.add("connect_google")
+                try:
+                    response = await self.gemini.aio.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            genai_types.Content(
+                                role="user",
+                                parts=[genai_types.Part.from_text(text=user_payload)],
+                            )
+                        ],
+                        config=config,
+                    )
+                    selected = self._parse_router_json(response.text or "")
+                    if selected:
+                        return [name for name in selected if name in self.registry.functions]
+                except Exception as exc:
+                    status = getattr(exc, "status_code", None)
+                    self.log.warning(
+                        "Gemini tool router failed | model=%s status=%s error=%s",
+                        model_name,
+                        status,
+                        _redact_log_text(str(exc)[:700]),
+                    )
+                    if status == 429:
+                        continue  # daily quota exhausted on this model; try next
 
-        if matches(r"\b(github|repository|repo|pull request|\bpr\b|github issue)\b"):
-            if matches(r"\b(create|open|file|report)\b.{0,30}\b(issue)\b"):
-                selected.add("github_create_issue")
-            if matches(r"\b(issue|issues|bug)\b"):
-                selected.add("github_list_issues")
-            if matches(r"\b(repo|repository|repositories|github)\b"):
-                selected.add("github_list_repos")
-
-        if matches(r"\b(remind me|set (a )?reminder|create (a )?reminder|alarm)\b"):
-            selected.add("set_reminder")
-        if matches(r"\b(list|show|my|check)\b.{0,30}\b(reminders?)\b"):
-            selected.add("list_reminders")
-        if matches(r"\b(delete|remove|cancel|edit|update)\b.{0,30}\b(reminders?)\b"):
-            selected.update({"list_reminders", "delete_reminder", "edit_reminder"})
-        if matches(r"\b(acknowledge|mark.*handled|dismiss)\b.{0,40}\b(watch|alert|notification)\b"):
-            selected.add("acknowledge_watch_hit")
-        if matches(r"\b(watch|monitor|track|alert me|notify me)\b"):
-            if matches(r"\b(create|start|set up|monitor|track|watch)\b"):
-                selected.add("create_watch")
-            if matches(r"\b(list|show|my|check)\b"):
-                selected.add("list_watches")
-            if matches(r"\b(update|edit|delete|remove|stop)\b"):
-                selected.update({"list_watches", "update_watch", "delete_watch"})
-
-        if matches(r"\b(weather|forecast|temperature)\b"):
-            selected.add("get_weather")
-        if matches(r"\b(direction|directions|route|how do i get|navigate)\b"):
-            selected.update({"get_directions", "get_map_link"})
-        if matches(r"\b(near me|nearby|near [a-z]|find (a )?(place|restaurant|cafe|hotel)|places in)\b"):
-            selected.add("search_places")
-        if matches(r"\b(map image|show (me )?a map|map of)\b"):
-            selected.add("get_map_image")
-        if matches(r"\b(map link|location link|osm link)\b"):
-            selected.add("get_map_link")
-
-        if interaction_type == "callback":
-            selected.update({"get_telegram_ui_context", "send_inline_keyboard", "edit_telegram_message"})
-        elif matches(r"\b(create|add|show|edit|update|delete|remove|pin|unpin)\b.{0,35}\b(button|keyboard|menu|telegram message)\b"):
-            selected.update({"get_telegram_ui_context", "send_inline_keyboard", "edit_telegram_message", "delete_telegram_message", "pin_telegram_message", "unpin_telegram_message"})
-        if matches(r"\b(analy[sz]e|describe|read)\b.{0,35}\b(image|photo|picture|document|pdf)\b"):
-            if matches(r"\b(image|photo|picture)\b"):
-                selected.add("analyze_image")
-            if matches(r"\b(document|pdf)\b"):
-                selected.add("analyze_document")
-        if matches(r"\b(send|share)\b.{0,30}\b(image|photo|picture|file|document|media)\b"):
-            selected.update({"get_current_media_file_id", "send_telegram_media"})
-        if matches(r"\b(what file|file id|media id|reuse (this|the) (image|photo|file))\b"):
-            selected.add("get_current_media_file_id")
-        if matches(r"\b(telegram context|inspect telegram|what buttons|current buttons)\b"):
-            selected.add("inspect_telegram_context")
-
-        if matches(r"\b(pin)\b.{0,30}\b(message|this)\b"):
-            selected.add("pin_telegram_message")
-        if matches(r"\b(unpin)\b.{0,30}\b(message|this)\b"):
-            selected.add("unpin_telegram_message")
-
-        if prior and not selected:
-            selected.update(self._regex_tool_names_for_request(prior, None, "message"))
-
-        return [name for name in sorted(selected) if name in self.registry.functions]
+        return []
 
     async def _select_tool_names_for_request(
         self,
@@ -1383,64 +1781,45 @@ class SakuraAgent:
         history: list[dict[str, str]] | None = None,
         interaction_type: str = "message",
     ) -> list[str]:
-        """Regex routing + optional semantic routing + a small always-on core."""
-        selected = set(self._regex_tool_names_for_request(user_text, history, interaction_type))
+        history = history or []
 
-        semantic_candidates = await self._semantic_tool_candidates(user_text, self.TOOL_ROUTER_TOP_K)
-        selected.update(name for name in semantic_candidates if name in self.registry.functions)
+        candidates = await self._semantic_tool_candidates(
+            user_text,
+            history,
+            interaction_type,
+            top_k=self.TOOL_ROUTER_TOP_K,
+        )
 
-        core = {
-            "current_time", "calculate", "web_search", "save_note", "search_notes",
-            "recent_notes", "set_reminder", "list_reminders", "get_weather",
-            "update_user_profile", "translate_text", "fetch_url",
-        }
-        selected.update(name for name in core if name in self.registry.functions)
+        # If retrieval produced nothing meaningful, let the arbiter decide
+        # against the full catalog instead of silently returning zero tools.
+        if not candidates:
+            candidates = [(name, 0.0) for name in sorted(self.registry.functions)]
 
-        # Avoid flooding the model with the whole registry: core + explicit
-        # intents + the best semantic matches, capped deterministically.
-        preferred = []
-        for name in self._regex_tool_names_for_request(user_text, history, interaction_type):
-            if name not in preferred:
-                preferred.append(name)
-        for name in semantic_candidates:
-            if name not in preferred:
-                preferred.append(name)
-        for name in sorted(core):
-            if name not in preferred:
-                preferred.append(name)
-        for name in sorted(selected):
-            if name not in preferred:
-                preferred.append(name)
+        try:
+            selected = await self._llm_route_candidates(
+                user_text,
+                history,
+                candidates,
+                interaction_type,
+            )
+        except Exception as exc:
+            self.log.warning(
+                "Tool arbiter failed; falling back to semantic candidates | error=%s",
+                _redact_log_text(str(exc)[:500]),
+            )
+            selected = []
 
-        # Keep a little more room for capability discovery while preventing a
-        # huge tools payload on every request.
-        return [name for name in preferred[: max(16, self.TOOL_ROUTER_TOP_K + 8)] if name in self.registry.functions]
+        # If the arbiter still returns nothing (or failed), fall back to the
+        # single best semantic candidate rather than a broad unconditional set.
+        if not selected:
+            selected = [candidates[0][0]]
 
-    def _expand_tool_names_after_execution(
-        self,
-        current_names: list[str],
-        executed_tool: str,
-    ) -> list[str]:
-        """Preserve current suite and only stage direct dependency successors."""
-        names = list(current_names)
+        return [
+            name
+            for name in selected[:12]
+            if name in self.registry.functions
+        ]
 
-        staged_successors = {
-            "gmail_list": ["gmail_read"],
-            "gmail_read": ["gmail_send_attachment"],
-            "search_notes": ["update_note", "delete_note", "send_telegram_media"],
-            "recent_notes": ["update_note", "delete_note"],
-            "list_reminders": ["delete_reminder", "edit_reminder"],
-            "list_watches": ["update_watch", "delete_watch", "acknowledge_watch_hit"],
-            "drive_list": ["docs_read"],
-            "get_telegram_ui_context": ["edit_telegram_message", "delete_telegram_message"],
-            "get_current_media_file_id": ["send_telegram_media"],
-        }
-
-        for next_tool in staged_successors.get(executed_tool, []):
-            if next_tool in self.registry.functions and next_tool not in names:
-                names.append(next_tool)
-
-        return names
 
     def _build_static_system_prompt(self) -> str:
         return """
@@ -1503,6 +1882,22 @@ Solve the user's actual request. Do not describe how it could be solved.
 You receive a contextual subset of tools per request — use them, don't
 list them. If no tool fits, answer from what you know, then say what
 would help.
+
+═══════════════════════════════════════════════════════════════════════
+TOOL ROUTING
+═══════════════════════════════════════════════════════════════════════
+- The application gives you only a small, semantically retrieved tool surface.
+- Candidate retrieval is not proof that a tool is needed. Decide from the user's
+  actual intent and the supplied tool descriptions.
+- If no supplied tool matches the request, do not invent a tool or capability.
+- For dependent actions, use the prerequisite lookup first and then continue from
+  the real returned IDs.
+- For monitor management: list_watches is the source of truth; update_watch and
+  delete_watch require a real watch_id; delete_all_watches handles a request to
+  remove every active monitor and requires confirmation.
+- Never claim a tool action happened unless its result explicitly indicates success.
+- The absence of a tool from the current surface does not prove Sakura can never
+  support it; it only means it was not selected for this request.
 
 ═══════════════════════════════════════════════════════════════════════
 TOOLS
@@ -1761,6 +2156,18 @@ tell the user what's failing and ask how they'd like to proceed.
             tool_names,
         )
 
+    def _groq_candidates(
+        self,
+        tools: list[dict[str, Any]] | None,
+        model_override: str | None = None,
+    ) -> list[str]:
+        """Return the ordered list of models to try for this request."""
+        if model_override:
+            return [model_override]
+        if tools:
+            return [m for m in self.GROQ_TOOL_CAPABLE if m in self.GROQ_MODELS]
+        return list(self.GROQ_MODELS)
+
     async def _groq_request(
         self,
         messages: list[dict[str, Any]],
@@ -1768,6 +2175,7 @@ tell the user what's failing and ask how they'd like to proceed.
         tools: list[dict[str, Any]] | None,
         phase: str = "agent",
         max_completion_tokens: int | None = None,
+        model_override: str | None = None,
     ):
         # ------------------------------------------------------------------
         # 1. Hard size check before touching the budget.
@@ -1780,9 +2188,9 @@ tell the user what's failing and ask how they'd like to proceed.
             )
 
         # ------------------------------------------------------------------
-        # 2. Atomic reservation from the global (org-level) budget.
-        #    Two concurrent calls cannot both pass this check — MongoDB
-        #    applies the filter + increment atomically on a single document.
+        # 2. Atomic reservation from the global (org-level) budget. Reserved
+        #    once for the whole rotation; released in finally if no model
+        #    succeeds.
         # ------------------------------------------------------------------
         estimated_tokens = self._estimate_tokens(messages, tools)
         reserved = await self.self_state.reserve_groq_tokens(
@@ -1801,84 +2209,99 @@ tell the user what's failing and ask how they'd like to proceed.
             )
 
         # ------------------------------------------------------------------
-        # 3. Run the request. On success, reconcile with the real usage.
-        #    On any failure, release the reservation. Exactly one of
-        #    {reconcile, release} always runs per successful reservation.
+        # 3. Rotate through models. On 429, cool that model down and try the
+        #    next one. On schema-invalid tool calls, retry once without
+        #    tools on the same model. On 5xx, retry once on the same model.
         # ------------------------------------------------------------------
         try:
-            if time.monotonic() < self._groq_cooldown_until:
-                raise ProviderFailure(
-                    "groq",
-                    "Groq is temporarily rate limited.",
-                    rate_limited=True,
-                )
+            candidates = self._groq_candidates(tools, model_override)
+            last_error: Exception | None = None
+            last_rate_limited = False
 
-            kwargs: dict[str, Any] = {
-                "messages": messages,
-                "model": self.MODEL_GROQ,
-                "temperature": 0.05 if tools else 0.2,
-                "top_p": 0.9,
-                # Keep tool-call rounds compact while giving final/no-tools
-                # synthesis enough room for a complete response.
-                "max_completion_tokens": (
-                    int(max_completion_tokens)
-                    if max_completion_tokens is not None
-                    else (350 if tools else 1400)
-                ),
-                "reasoning_effort": "low",
-            }
+            for model_name in candidates:
+                if time.monotonic() < self._groq_cooldown_until.get(model_name, 0.0):
+                    self.log.debug(
+                        "Skipping %s (cooldown) | phase=%s", model_name, phase,
+                    )
+                    continue
 
-            # Only send tool params when at least one tool is available.
-            # Some Groq-compatible model versions can emit a phantom tool call
-            # when sent tools=None plus tool_choice="none"; omitting the entire
-            # tool surface avoids that invalid-request path.
-            if tools:
-                kwargs.update(
-                    {
-                        "tools": tools,
-                        "tool_choice": "auto",
-                        "parallel_tool_calls": False,
-                        "include_reasoning": False,
-                    }
-                )
+                request_tools = tools
+                kwargs: dict[str, Any] = {
+                    "messages": messages,
+                    "model": model_name,
+                    "temperature": 0.05 if request_tools else 0.2,
+                    "top_p": 0.9,
+                    "max_completion_tokens": (
+                        int(max_completion_tokens)
+                        if max_completion_tokens is not None
+                        else (350 if request_tools else 1400)
+                    ),
+                    "reasoning_effort": "low",
+                }
+                if request_tools:
+                    kwargs.update(
+                        {
+                            "tools": request_tools,
+                            "tool_choice": "auto",
+                            "parallel_tool_calls": False,
+                            "include_reasoning": False,
+                        }
+                    )
 
-            async with self._llm_gate:
-                attempts = 2
-
-                for attempt in range(attempts):
+                for attempt in range(2):
                     try:
-                        response = await self.groq.chat.completions.create(**kwargs)
-
+                        async with self._llm_gate:
+                            response = await self.groq.chat.completions.create(**kwargs)
                     except RateLimitError as exc:
-                        self._groq_cooldown_until = (
+                        self._groq_cooldown_until[model_name] = (
                             time.monotonic() + self._extract_retry_after(exc)
                         )
-                        self._log_groq_failure(exc, phase=phase, tools=tools)
-                        raise ProviderFailure(
-                            "groq",
-                            "Groq free-tier rate limit reached.",
-                            rate_limited=True,
-                        ) from exc
-
+                        self._log_groq_failure(exc, phase=phase, tools=request_tools)
+                        last_error = exc
+                        last_rate_limited = True
+                        break  # try next model
                     except (APITimeoutError, APIConnectionError) as exc:
-                        self._log_groq_failure(exc, phase=phase, tools=tools)
+                        self._log_groq_failure(exc, phase=phase, tools=request_tools)
+                        last_error = exc
                         if attempt == 0:
                             await asyncio.sleep(0.75)
                             continue
-                        raise ProviderFailure(
-                            "groq",
-                            f"{type(exc).__name__}: {exc}",
-                        ) from exc
-
+                        break  # try next model
                     except Exception as exc:
-                        self._log_groq_failure(exc, phase=phase, tools=tools)
+                        self._log_groq_failure(exc, phase=phase, tools=request_tools)
+                        last_error = exc
                         status = getattr(exc, "status_code", None)
+
+                        # Groq validated a generated tool call against the
+                        # schema and rejected the request. Drop the tool
+                        # surface and retry once on the same model.
+                        if (
+                            status is not None
+                            and int(status) == 400
+                            and request_tools
+                            and "tool_use_failed" in str(exc)
+                            and attempt == 0
+                        ):
+                            self.log.warning(
+                                "Groq tool_use_failed; retrying without tools | "
+                                "model=%s phase=%s",
+                                model_name,
+                                phase,
+                            )
+                            kwargs.pop("tools", None)
+                            kwargs.pop("tool_choice", None)
+                            kwargs.pop("parallel_tool_calls", None)
+                            kwargs.pop("include_reasoning", None)
+                            kwargs["temperature"] = 0.2
+                            request_tools = None
+                            continue
+
                         if status is not None and int(status) >= 500 and attempt == 0:
                             await asyncio.sleep(0.75)
                             continue
-                        raise ProviderFailure("groq", str(exc)) from exc
+                        break  # try next model
 
-                    # Success — reconcile the reservation with actual usage.
+                    # ---- Success ----
                     usage = getattr(response, "usage", None)
                     actual_tokens = getattr(usage, "total_tokens", None) if usage else None
                     reservation_handled = False
@@ -1889,32 +2312,25 @@ tell the user what's failing and ask how they'd like to proceed.
                                 actual_tokens=int(actual_tokens),
                             )
                         else:
-                            # Groq didn't report usage — release so the day's
-                            # counter is not permanently reduced.
                             await self.self_state.release_groq_reservation(reserved)
                         reservation_handled = True
                     except Exception:
                         self.log.warning(
                             "Failed to reconcile/release Groq reservation "
                             "| reserved=%s actual=%s",
-                            reserved,
-                            actual_tokens,
-                            exc_info=True,
+                            reserved, actual_tokens, exc_info=True,
                         )
-                        # Keep the reservation non-zero so the outer finally
-                        # releases it instead of leaking the daily budget.
                     if reservation_handled:
                         reserved = 0
-
                     return response
 
-                # Unreachable: every branch above either returns or raises.
-                raise ProviderFailure("groq", "Groq request loop exited unexpectedly.")
-
+            # All candidates exhausted.
+            raise ProviderFailure(
+                "groq",
+                f"All Groq models failed or are rate-limited. Last: {last_error}",
+                rate_limited=last_rate_limited,
+            )
         finally:
-            # Covers every failure path — the request never leaves a
-            # reservation dangling, so the next request can use that
-            # budget immediately.
             if reserved:
                 with contextlib.suppress(Exception):
                     await self.self_state.release_groq_reservation(reserved)
@@ -2014,6 +2430,10 @@ tell the user what's failing and ask how they'd like to proceed.
                             _redact_log_text(str(exc)[:800]),
                         )
 
+                        if status == 429:
+                            response = None
+                            break
+
                         if retryable and attempt < 2:
                             await asyncio.sleep(0.75 * (2 ** attempt))
                             continue
@@ -2075,11 +2495,6 @@ tell the user what's failing and ask how they'd like to proceed.
                     args = dict(call.args or {})
                     result = await self._execute_tool(call.name, args)
 
-                    active_tool_names = self._expand_tool_names_after_execution(
-                        active_tool_names,
-                        call.name,
-                    )
-
                     contents.append(
                         genai_types.Content(
                             role="user",
@@ -2103,10 +2518,7 @@ tell the user what's failing and ask how they'd like to proceed.
 
     def _enforce_tool_prerequisite(self, name: str, args: dict[str, Any]) -> None:
         ctx = self.request_context
-        if name in {
-            "edit_telegram_message", "delete_telegram_message",
-            "pin_telegram_message", "unpin_telegram_message",
-        } and args.get("message_id") is not None:
+        if name in self._MSG_ID_TOOLS and args.get("message_id") is not None:
             supplied = str(args.get("message_id")).strip()
             current = str(getattr(ctx.message, "message_id", "") or "")
             if supplied != current and not ctx.knows("telegram_message_id", supplied):
@@ -2114,19 +2526,7 @@ tell the user what's failing and ask how they'd like to proceed.
                     f"{name} refused to use an unknown Telegram message_id. Use the current callback/message or a message_id returned by get_telegram_ui_context."
                 )
 
-        prerequisites = {
-            "gmail_read": (("message_id", "message_id"),),
-            "gmail_send_attachment": (("message_id", "message_id"), ("attachment_id", "attachment_id")),
-            "docs_read": (("document_id", "document_id"),),
-            "update_note": (("note_id", "note_id"),),
-            "delete_note": (("note_id", "note_id"),),
-            "delete_reminder": (("reminder_id", "reminder_id"),),
-            "edit_reminder": (("reminder_id", "reminder_id"),),
-            "update_watch": (("watch_id", "watch_id"),),
-            "delete_watch": (("watch_id", "watch_id"),),
-            "send_telegram_media": (("file_id", "file_id"),),
-        }
-        requirements = prerequisites.get(name)
+        requirements = self._TOOL_PREREQUISITES.get(name)
         if not requirements:
             return
         for arg_name, id_kind in requirements:
@@ -2546,6 +2946,15 @@ tell the user what's failing and ask how they'd like to proceed.
             persistent_entities = await self.entity_store.load(telegram_id)
             ctx.load_entities(persistent_entities)
 
+            if (
+                continuity.get("active_entity_type")
+                and continuity.get("active_entity_id")
+            ):
+                ctx.remember(
+                    str(continuity["active_entity_type"]) + "_id",
+                    str(continuity["active_entity_id"]),
+                )
+
             confirmed_answer = await self._handle_pending_confirmation(
                 user_text,
                 continuity.get("pending_confirmation"),
@@ -2557,15 +2966,6 @@ tell the user what's failing and ask how they'd like to proceed.
                     confirmed_answer,
                 )
                 return confirmed_answer
-
-            if (
-                continuity.get("active_entity_type")
-                and continuity.get("active_entity_id")
-            ):
-                ctx.remember(
-                    str(continuity["active_entity_type"]) + "_id",
-                    str(continuity["active_entity_id"]),
-                )
 
             active_tool_names = await self._select_tool_names_for_request(
                 user_text,
@@ -2712,6 +3112,7 @@ tell the user what's failing and ask how they'd like to proceed.
                 )
 
                 for tc in tool_calls[:4]:
+                    args: dict[str, Any] = {}
                     try:
                         args = json.loads(tc.function.arguments or "{}")
                         if not isinstance(args, dict):
@@ -2756,11 +3157,19 @@ tell the user what's failing and ask how they'd like to proceed.
                     tool_messages.append(tool_message)
                     messages.append(tool_message)
 
-                    if self._tool_result_ok(result):
-                        active_tool_names = self._expand_tool_names_after_execution(
-                            active_tool_names,
-                            tc.function.name,
-                        )
+                    # --------------------------------------------------------
+                    # Structural recovery: if the tool refused because the
+                    # model supplied an untrusted ID, stage the corresponding
+                    # lookup tool so the model can retry with a real ID on the
+                    # next round. This is triggered by an observed structural
+                    # failure — not by user wording — so it is not intent
+                    # routing and does not bias tool selection.
+                    # --------------------------------------------------------
+                    if not self._tool_result_ok(result) and "not a trusted ID" in result:
+                        lookup_tool = self._LOOKUP_FOR_TOOL.get(tc.function.name)
+                        if lookup_tool and lookup_tool not in active_tool_names:
+                            active_tool_names.append(lookup_tool)
+
                     if suppress_final and self._tool_result_ok(result):
                         await self.conversations.add(
                             telegram_id,
@@ -2799,26 +3208,10 @@ tell the user what's failing and ask how they'd like to proceed.
                         _redact_log_text(str(groq_failure)[:1000]),
                     )
 
-                    # Do NOT chain to Gemini here — that would cost a full
-                    # second prompt with the whole tool history. Return a
-                    # partial summary instead so the user knows what ran.
-                    successful_tools = [
-                        c["tool"] for c in executed_calls
-                        if self._tool_result_ok(c["result"])
-                    ]
-                    if successful_tools:
-                        answer = (
-                            "🌸 I completed: "
-                            + ", ".join(successful_tools)
-                            + ". The AI service couldn't compose a final reply, "
-                            "but the actions above went through."
-                        )
-                    else:
-                        answer = (
-                            "🌸 I couldn't reach my AI service right now. "
-                            "Please try again in a moment."
-                        )
-
+                    # Never hide a successful tool action behind a generic
+                    # "AI couldn't compose a reply" message. We already have the
+                    # real tool result, so format that result locally.
+                    answer = self._deterministic_tool_fallback(executed_calls)
                     await self.conversations.add(
                         telegram_id,
                         "assistant",
@@ -2827,27 +3220,15 @@ tell the user what's failing and ask how they'd like to proceed.
                     return answer
 
             if executed_calls:
-                try:
-                    final_response = await self._groq_request(
-                        messages,
-                        tools=None,
-                        phase="tool_loop_finalizer",
-                        max_completion_tokens=1400,
-                    )
-                    answer = sanitize_answer(
-                        getattr(final_response.choices[0].message, "content", "") or ""
-                    )
-                    if answer:
-                        await self.conversations.add(telegram_id, "assistant", answer)
-                        return answer
-                except Exception as exc:
-                    self.log.warning(
-                        "Tool-loop finalizer failed | request_id=%s error=%s",
-                        ctx.request_id,
-                        _redact_log_text(str(exc)[:700]),
-                    )
+                answer = self._deterministic_tool_fallback(executed_calls)
+                await self.conversations.add(
+                    telegram_id,
+                    "assistant",
+                    answer,
+                )
+                return answer
 
-            answer = "🌸 I completed the available actions, but couldn't compose the final response right now."
+            answer = "🌸 I couldn't complete that request."
             await self.conversations.add(
                 telegram_id,
                 "assistant",
@@ -2878,7 +3259,12 @@ tell the user what's failing and ask how they'd like to proceed.
             },
             {"role": "user", "content": text},
         ]
-        response = await self._groq_request(messages, tools=None, phase="translation")
+        response = await self._groq_request(
+            messages,
+            tools=None,
+            phase="translation",
+            model_override=self.GROQ_LITE_MODELS[0],
+        )
         return (response.choices[0].message.content or "").strip()
 
     async def connect_google(self) -> str:
@@ -2926,7 +3312,11 @@ tell the user what's failing and ask how they'd like to proceed.
                 except Exception as exc:
                     last_error = exc
                     status = getattr(exc, "status_code", None)
-                    if status in {429, 500, 502, 503, 504} and attempt < 2:
+                    if status == 429:
+                        # Quota exhausted for this model; skip the retries
+                        # and move to the next model in the list.
+                        break
+                    if status in {500, 502, 503, 504} and attempt < 2:
                         await asyncio.sleep(0.75 * (2 ** attempt))
                         continue
                     break
